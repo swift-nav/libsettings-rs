@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "sbp-settings",
+    "sbp-settings-sys"
+]
