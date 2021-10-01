@@ -1,0 +1,3 @@
+[submodule "sbp-settings-sys/src/libsettings"]
+	path = src/libsettings
+	url = https://github.com/swift-nav/libsettings
