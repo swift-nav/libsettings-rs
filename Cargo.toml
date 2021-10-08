@@ -1,6 +1,6 @@
 [package]
 name = "sbp-settings"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Swift Navigation <dev@swift-nav.com>"]
 edition = "2018"
 description = "SwiftNav settings API library"
@@ -25,7 +25,7 @@ crossbeam-utils = "0.8"
 log = "0.4"
 once_cell = "1"
 parking_lot = "0.11"
-sbp = { version = "3.4.11-beta", features = ["link"] }
+sbp = { version = "4.0.1", features = ["link"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.8"
 
