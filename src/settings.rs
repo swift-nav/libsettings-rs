@@ -113,15 +113,10 @@ impl fmt::Display for SettingValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SettingValue::Integer(s) => s.fmt(f),
-            SettingValue::Boolean(s) => {
-                // For consistency with the C version of libsettings, use the
-                // same boolean literals
-                if *s {
-                    write!(f, "True")
-                } else {
-                    write!(f, "False")
-                }
-            }
+            // For consistency with the C version of libsettings, use the
+            // same boolean literals
+            SettingValue::Boolean(true) => write!(f, "True"),
+            SettingValue::Boolean(false) => write!(f, "False"),
             SettingValue::Float(s) => s.fmt(f),
             SettingValue::String(s) => s.fmt(f),
         }
@@ -251,5 +246,11 @@ mod tests {
     fn test_na_is_none() {
         let setting = lookup_setting("tcp_server0", "enabled_sbp_messages").unwrap();
         assert_eq!(setting.units, None);
+    }
+
+    #[test]
+    fn test_bool_display() {
+        assert_eq!(SettingValue::Boolean(true).to_string(), "True");
+        assert_eq!(SettingValue::Boolean(false).to_string(), "False");
     }
 }
