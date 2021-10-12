@@ -113,7 +113,15 @@ impl fmt::Display for SettingValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SettingValue::Integer(s) => s.fmt(f),
-            SettingValue::Boolean(s) => s.fmt(f),
+            SettingValue::Boolean(s) => {
+                // For consistency with the C version of libsettings, use the
+                // same boolean literals
+                if *s {
+                    write!(f, "True")
+                } else {
+                    write!(f, "False")
+                }
+            }
             SettingValue::Float(s) => s.fmt(f),
             SettingValue::String(s) => s.fmt(f),
         }
