@@ -16,6 +16,7 @@ use crate::bindings::{
     settings_write_res_e_SETTINGS_WR_SETTING_REJECTED, settings_write_res_e_SETTINGS_WR_TIMEOUT,
     settings_write_res_e_SETTINGS_WR_VALUE_REJECTED, settings_write_str, size_t,
 };
+use crossbeam_channel::Receiver;
 use crossbeam_utils::thread;
 use log::{debug, error, warn};
 use sbp::{
@@ -26,6 +27,7 @@ use sbp::{
 use crate::{settings, SettingKind, SettingValue};
 
 const SENDER_ID: u16 = 0x42;
+const NUM_WORKERS: usize = 5;
 
 pub struct Client<'a> {
     inner: Box<ClientInner<'a>>,
@@ -40,9 +42,8 @@ struct ClientInner<'a> {
 impl Drop for ClientInner<'_> {
     fn drop(&mut self) {
         unsafe {
-            // Safety: Created via Box::into_raw
-            let _ = Box::from_raw(self.context);
-            // Safety: Created via Box::into_raw
+            // Safety: self.api was created via Box::into_raw.
+            // self.context is freed via the call to settings_destroy
             let _ = Box::from_raw(self.api);
             settings_destroy(&mut self.ctx);
         }
@@ -105,8 +106,31 @@ impl<'a> Client<'a> {
     }
 
     pub fn read_all(&self) -> Vec<Result<ReadByIdxResult, Error<ReadSettingError>>> {
-        const NUM_WORKERS: usize = 5;
+        let (_, r) = crossbeam_channel::bounded(0);
+        self.read_all_inner(r)
+    }
 
+    pub fn read_all_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Vec<Result<ReadByIdxResult, Error<ReadSettingError>>> {
+        let (s, r) = crossbeam_channel::bounded(NUM_WORKERS);
+        thread::scope(move |scope| {
+            scope.spawn(move |_| {
+                std::thread::sleep(timeout);
+                for _ in 0..NUM_WORKERS {
+                    s.send(()).unwrap();
+                }
+            });
+            self.read_all_inner(r)
+        })
+        .unwrap()
+    }
+
+    fn read_all_inner(
+        &self,
+        stop: Receiver<()>,
+    ) -> Vec<Result<ReadByIdxResult, Error<ReadSettingError>>> {
         thread::scope(move |scope| {
             let (idx_s, idx_r) = crossbeam_channel::bounded(NUM_WORKERS);
             let (results_s, results_r) = crossbeam_channel::unbounded();
@@ -121,11 +145,15 @@ impl<'a> Client<'a> {
             for _ in 0..NUM_WORKERS {
                 let idx_r = idx_r.clone();
                 let results_s = results_s.clone();
+                let stop = stop.clone();
                 scope.spawn(move |_| {
                     for idx in idx_r.iter() {
                         match self.read_by_index(idx).map_err(Error::Err).transpose() {
                             Some(res) => results_s.send(res).expect("results channel closed"),
                             None => break,
+                        }
+                        if stop.try_recv().is_ok() {
+                            break;
                         }
                     }
                 });
@@ -749,14 +777,14 @@ mod tests {
 
         let request_msg = MsgSettingsReadReq {
             sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0", group, name)),
         };
 
         stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
 
         let reply_msg = MsgSettingsReadResp {
             sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\010\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\010\0", group, name)),
         };
 
         stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
@@ -773,14 +801,14 @@ mod tests {
 
         let request_msg = MsgSettingsReadReq {
             sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0", group, name)),
         };
 
         stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
 
         let reply_msg = MsgSettingsReadResp {
             sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\0True\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0True\0", group, name)),
         };
 
         stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
@@ -797,14 +825,14 @@ mod tests {
 
         let request_msg = MsgSettingsReadReq {
             sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0", group, name)),
         };
 
         stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
 
         let reply_msg = MsgSettingsReadResp {
             sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\00.1\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\00.1\0", group, name)),
         };
 
         stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
@@ -822,14 +850,14 @@ mod tests {
 
         let request_msg = MsgSettingsReadReq {
             sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0", group, name)),
         };
 
         stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
 
         let reply_msg = MsgSettingsReadResp {
             sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0foo\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0foo\0", group, name)),
         };
 
         stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
@@ -847,14 +875,14 @@ mod tests {
 
         let request_msg = MsgSettingsReadReq {
             sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0", group, name)),
         };
 
         stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
 
         let reply_msg = MsgSettingsReadResp {
             sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\0Secondary\0", group, name).to_string()),
+            setting: SbpString::from(format!("{}\0{}\0Secondary\0", group, name)),
         };
 
         stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
