@@ -128,7 +128,7 @@ impl<'a> Client<'a> {
                 }
             });
             let res = self.read_all_inner(stop_r);
-            done_s.send(()).unwrap();
+            let _ = done_s.send(());
             res
         })
         .unwrap()
