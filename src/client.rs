@@ -105,7 +105,7 @@ impl<'a> Client<'a> {
         Client { inner }
     }
 
-    pub fn read_all(&self) -> Vec<Result<ReadByIdxResult, Error<ReadSettingError>>> {
+    pub fn read_all(&self) -> (Vec<ReadByIdxResult>, Vec<Error<ReadSettingError>>) {
         let (_, r) = crossbeam_channel::bounded(0);
         self.read_all_inner(r)
     }
@@ -113,16 +113,23 @@ impl<'a> Client<'a> {
     pub fn read_all_timeout(
         &self,
         timeout: Duration,
-    ) -> Vec<Result<ReadByIdxResult, Error<ReadSettingError>>> {
-        let (s, r) = crossbeam_channel::bounded(NUM_WORKERS);
+    ) -> (Vec<ReadByIdxResult>, Vec<Error<ReadSettingError>>) {
+        let (done_s, done_r) = crossbeam_channel::bounded(0);
+        let (stop_s, stop_r) = crossbeam_channel::bounded(NUM_WORKERS);
         thread::scope(move |scope| {
             scope.spawn(move |_| {
-                std::thread::sleep(timeout);
+                crossbeam_channel::select! {
+                    recv(done_r) -> _ => return,
+                    default(timeout) => (),
+                };
+                warn!("settings read_all timed out");
                 for _ in 0..NUM_WORKERS {
-                    s.send(()).unwrap();
+                    let _ = stop_s.try_send(());
                 }
             });
-            self.read_all_inner(r)
+            let res = self.read_all_inner(stop_r);
+            done_s.send(()).unwrap();
+            res
         })
         .unwrap()
     }
@@ -130,10 +137,11 @@ impl<'a> Client<'a> {
     fn read_all_inner(
         &self,
         stop: Receiver<()>,
-    ) -> Vec<Result<ReadByIdxResult, Error<ReadSettingError>>> {
+    ) -> (Vec<ReadByIdxResult>, Vec<Error<ReadSettingError>>) {
         thread::scope(move |scope| {
             let (idx_s, idx_r) = crossbeam_channel::bounded(NUM_WORKERS);
-            let (results_s, results_r) = crossbeam_channel::unbounded();
+            let (settings_s, settings_r) = crossbeam_channel::unbounded();
+            let (errors_s, errors_r) = crossbeam_channel::unbounded();
 
             scope.spawn(move |_| {
                 let mut idx = 0;
@@ -143,24 +151,32 @@ impl<'a> Client<'a> {
             });
 
             for _ in 0..NUM_WORKERS {
-                let idx_r = idx_r.clone();
-                let results_s = results_s.clone();
-                let stop = stop.clone();
-                scope.spawn(move |_| {
-                    for idx in idx_r.iter() {
-                        match self.read_by_index(idx).map_err(Error::Err).transpose() {
-                            Some(res) => results_s.send(res).expect("results channel closed"),
-                            None => break,
-                        }
-                        if stop.try_recv().is_ok() {
-                            break;
+                scope.spawn({
+                    let idx_r = idx_r.clone();
+                    let settings_s = settings_s.clone();
+                    let errors_s = errors_s.clone();
+                    let stop = stop.clone();
+                    move |_| {
+                        for idx in idx_r.iter() {
+                            if stop.try_recv().is_ok() {
+                                break;
+                            }
+                            match self.read_by_index(idx) {
+                                Ok(Some(setting)) => settings_s.send(setting).unwrap(),
+                                Ok(None) => break,
+                                Err(err) => {
+                                    errors_s.send(Error::Err(err)).unwrap();
+                                    break;
+                                }
+                            }
                         }
                     }
                 });
             }
-
-            drop(results_s);
-            results_r.iter().collect::<Vec<_>>()
+            drop(idx_r);
+            drop(settings_s);
+            drop(errors_s);
+            (settings_r.iter().collect(), errors_r.iter().collect())
         })
         .expect("read_all worker thread panicked")
     }
