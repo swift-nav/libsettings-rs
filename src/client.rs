@@ -173,6 +173,8 @@ impl<'a> Client<'a> {
                     }
                 });
             }
+            // we need to drop these before calling `.iter()` to disconnect the channels
+            // otherwise `.iter()` will never terminate
             drop(idx_r);
             drop(settings_s);
             drop(errors_s);
