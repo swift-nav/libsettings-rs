@@ -24,7 +24,7 @@ use sbp::{
     Sbp, SbpMessage,
 };
 
-use crate::{settings, SettingKind, SettingValue};
+use crate::{Setting, SettingKind, SettingValue};
 
 const SENDER_ID: u16 = 0x42;
 const NUM_WORKERS: usize = 5;
@@ -241,9 +241,7 @@ impl<'a> Client<'a> {
         group: &str,
         name: &str,
     ) -> Option<Result<SettingValue, Error<ReadSettingError>>> {
-        let setting = settings()
-            .iter()
-            .find(|s| s.group == group && s.name == name)?;
+        let setting = Setting::find(group, name)?;
 
         let cgroup = match CString::new(group) {
             Ok(cgroup) => cgroup,
@@ -770,7 +768,7 @@ mod tests {
         mut wtr: impl Write + 'static,
         group: &str,
         name: &str,
-    ) -> Option<Result<settings::SettingValue, Error<ReadSettingError>>> {
+    ) -> Option<Result<SettingValue, Error<ReadSettingError>>> {
         scope(move |scope| {
             let source = LinkSource::new();
             let link = source.link();

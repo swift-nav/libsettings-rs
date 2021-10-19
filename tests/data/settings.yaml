@@ -1,0 +1,16 @@
+- group: surveyed_position
+  name: broadcast
+  expert: false
+  type: boolean
+  units:
+  default value: "False"
+  readonly: false
+  enumerated possible values: True,False
+  Description: Broadcast surveyed base station position.
+  Notes: This flag ultimately determines whether the SBP message with identifier
+    MSG_BASE_POS_ECEF will be calculated and sent. Logically, setting this attribute to
+    "true" sets the Local receiver as a base station and configures the unit to send
+    its surveyed position coordinates to the other receiver(s) with which the base
+    station is communicating. If "true", the remote receiver that receives the
+    surveyed position will calculate and communicate a pseudo absolute
+    RTK position based upon the received position.
