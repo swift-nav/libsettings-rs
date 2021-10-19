@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, fs, io, path::Path};
 
 use once_cell::sync::OnceCell;
 use serde::{
@@ -6,20 +6,21 @@ use serde::{
     Deserialize, Deserializer,
 };
 
-pub fn settings() -> &'static [Setting] {
-    static SETTINGS: OnceCell<Vec<Setting>> = OnceCell::new();
-    SETTINGS.get_or_init(|| {
-        serde_yaml::from_str(include_str!(concat!(env!("OUT_DIR"), "/settings.yaml")))
-            .expect("could not parse settings.yaml")
-    })
+static SETTINGS: OnceCell<Vec<Setting>> = OnceCell::new();
+
+fn bundled_settings() -> Vec<Setting> {
+    let settings_yaml = include_str!(concat!(env!("OUT_DIR"), "/settings.yaml"));
+    serde_yaml::from_str(settings_yaml).expect("could not parse settings.yaml")
 }
 
-pub fn lookup_setting(group: impl AsRef<str>, name: impl AsRef<str>) -> Option<&'static Setting> {
-    let group = group.as_ref();
-    let name = name.as_ref();
-    settings()
-        .iter()
-        .find(|s| s.group == group && s.name == name)
+pub fn load_from_path(path: impl AsRef<Path>) -> Result<(), LoadFromPathError> {
+    let file = fs::File::open(path).map_err(LoadFromPathError::Io)?;
+    let settings: Vec<Setting> = serde_yaml::from_reader(file).map_err(LoadFromPathError::Serde)?;
+    load(settings).map_err(|_| LoadFromPathError::AlreadySet)
+}
+
+pub fn load(settings: Vec<Setting>) -> Result<(), Vec<Setting>> {
+    SETTINGS.set(settings)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -61,6 +62,21 @@ pub struct Setting {
     pub enumerated_possible_values: Option<String>,
 
     pub digits: Option<String>,
+}
+
+impl Setting {
+    pub fn all() -> &'static [Setting] {
+        let settings = SETTINGS.get_or_init(bundled_settings);
+        settings.as_slice()
+    }
+
+    pub fn find(group: impl AsRef<str>, name: impl AsRef<str>) -> Option<&'static Setting> {
+        let group = group.as_ref();
+        let name = name.as_ref();
+        Setting::all()
+            .iter()
+            .find(|s| s.group == group && s.name == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -216,14 +232,33 @@ where
     deserializer.deserialize_any(StringVisitor)
 }
 
+#[derive(Debug)]
+pub enum LoadFromPathError {
+    AlreadySet,
+    Io(io::Error),
+    Serde(serde_yaml::Error),
+}
+
+impl fmt::Display for LoadFromPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadFromPathError::AlreadySet => write!(f, "settings have already been loaded"),
+            LoadFromPathError::Io(e) => write!(f, "{}", e),
+            LoadFromPathError::Serde(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for LoadFromPathError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_lookup_setting() {
+    fn test_find_setting() {
         assert_eq!(
-            lookup_setting("solution", "soln_freq"),
+            Setting::find("solution", "soln_freq"),
             Some(&Setting {
                 name: "soln_freq".into(),
                 group: "solution".into(),
@@ -239,12 +274,12 @@ mod tests {
             })
         );
 
-        assert_eq!(lookup_setting("solution", "froo_froo"), None);
+        assert_eq!(Setting::find("solution", "froo_froo"), None);
     }
 
     #[test]
     fn test_na_is_none() {
-        let setting = lookup_setting("tcp_server0", "enabled_sbp_messages").unwrap();
+        let setting = Setting::find("tcp_server0", "enabled_sbp_messages").unwrap();
         assert_eq!(setting.units, None);
     }
 

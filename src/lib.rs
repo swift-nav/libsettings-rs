@@ -1,8 +1,8 @@
 mod client;
-mod settings;
+pub mod settings;
 
 pub use client::{Client, Error, ReadSettingError, WriteSettingError};
-pub use settings::{lookup_setting, settings, Setting, SettingKind, SettingValue};
+pub use settings::{Setting, SettingKind, SettingValue};
 
 pub(crate) mod bindings {
     #![allow(non_upper_case_globals)]
