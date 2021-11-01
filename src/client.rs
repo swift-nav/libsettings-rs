@@ -78,10 +78,10 @@ impl<'a> Client<'a> {
             signal_thd: Some(libsettings_signal_thd),
             lock: Some(libsettings_lock),
             unlock: Some(libsettings_unlock),
-            register_cb: Some(register_cb),
-            unregister_cb: Some(unregister_cb),
+            register_cb: Some(libsettings_register_cb),
+            unregister_cb: Some(libsettings_unregister_cb),
             log: None,
-            log_preformat: false,
+            log_preformatted: Some(libsettings_log_wrapper),
         });
 
         let mut inner = Box::new(ClientInner {
@@ -614,7 +614,7 @@ unsafe impl Send for CtxPtr {}
 
 #[no_mangle]
 /// Thread safety: Should be called with lock already held
-unsafe extern "C" fn register_cb(
+unsafe extern "C" fn libsettings_register_cb(
     ctx: *mut c_void,
     msg_type: u16,
     cb: sbp_msg_callback_t,
@@ -639,7 +639,7 @@ unsafe extern "C" fn register_cb(
 
 #[no_mangle]
 /// Thread safety: Should be called with lock already held
-unsafe extern "C" fn unregister_cb(
+unsafe extern "C" fn libsettings_unregister_cb(
     ctx: *mut c_void,
     node: *mut *mut sbp_msg_callbacks_node_t,
 ) -> i32 {
@@ -748,6 +748,23 @@ extern "C" fn libsettings_wait_init(ctx: *mut c_void) -> i32 {
     let context: &mut Context = unsafe { &mut *(ctx as *mut _) };
     context.event = Some(Event::new());
     0
+}
+
+#[no_mangle]
+extern "C" fn libsettings_log_wrapper(
+    priority: ::std::os::raw::c_int,
+    format: *const ::std::os::raw::c_char,
+) {
+    let level = match priority {
+        i32::MIN..=3 => log::Level::Error,
+        4 => log::Level::Warn,
+        5 => log::Level::Info,
+        6 => log::Level::Info,
+        7.. => log::Level::Debug,
+    };
+    let msg = unsafe { CStr::from_ptr(format) };
+    let msg = msg.to_string_lossy();
+    log::log!(level, "{}", msg);
 }
 
 #[cfg(test)]
