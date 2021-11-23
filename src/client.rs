@@ -65,7 +65,7 @@ impl<'a> Client<'a> {
     }
 
     pub fn write_setting(
-        &self,
+        &mut self,
         group: impl Into<String>,
         name: impl Into<String>,
         value: impl Into<String>,
@@ -75,7 +75,7 @@ impl<'a> Client<'a> {
     }
 
     pub fn write_setting_ctx(
-        &self,
+        &mut self,
         group: impl Into<String>,
         name: impl Into<String>,
         value: impl Into<String>,
@@ -85,7 +85,7 @@ impl<'a> Client<'a> {
     }
 
     pub fn read_setting(
-        &self,
+        &mut self,
         group: impl Into<String>,
         name: impl Into<String>,
     ) -> Result<Option<Entry>, Error> {
@@ -94,7 +94,7 @@ impl<'a> Client<'a> {
     }
 
     pub fn read_setting_ctx(
-        &self,
+        &mut self,
         group: impl Into<String>,
         name: impl Into<String>,
         ctx: Context,
@@ -102,16 +102,16 @@ impl<'a> Client<'a> {
         self.read_setting_inner(group.into(), name.into(), ctx)
     }
 
-    pub fn read_all(&self) -> (Vec<Entry>, Vec<Error>) {
+    pub fn read_all(&mut self) -> (Vec<Entry>, Vec<Error>) {
         let (ctx, _ctx_handle) = Context::new();
         self.read_all_ctx(ctx)
     }
 
-    pub fn read_all_ctx(&self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
+    pub fn read_all_ctx(&mut self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
         self.read_all_inner(ctx)
     }
 
-    fn read_all_inner(&self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
+    fn read_all_inner(&mut self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
         let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
         let done_key = self.link.register(move |_: MsgSettingsReadByIndexDone| {
             for _ in 0..NUM_WORKERS {
@@ -122,6 +122,7 @@ impl<'a> Client<'a> {
         let idx = AtomicU16::new(0);
         thread::scope(|scope| {
             for _ in 0..NUM_WORKERS {
+                let this = &self;
                 let idx = &idx;
                 let settings = &settings;
                 let errors = &errors;
@@ -129,7 +130,7 @@ impl<'a> Client<'a> {
                 let ctx = ctx.clone();
                 scope.spawn(move |_| loop {
                     let idx = idx.fetch_add(1, Ordering::SeqCst);
-                    match self.read_by_index(idx, done_rx, &ctx) {
+                    match this.read_by_index(idx, done_rx, &ctx) {
                         Ok(Some(setting)) => {
                             settings.lock().push((idx, setting));
                         }
@@ -183,7 +184,7 @@ impl<'a> Client<'a> {
     }
 
     fn read_setting_inner(
-        &self,
+        &mut self,
         group: String,
         name: String,
         ctx: Context,
@@ -220,7 +221,7 @@ impl<'a> Client<'a> {
     }
 
     fn write_setting_inner(
-        &self,
+        &mut self,
         group: String,
         name: String,
         value: String,
@@ -553,7 +554,7 @@ mod tests {
             },
         );
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
         assert!(matches!(response.value, Some(SettingValue::Integer(10))));
     }
@@ -563,26 +564,18 @@ mod tests {
         let (group, name) = ("sbp", "obs_msg_max_size");
         let mock = Mock::new();
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let (ctx, _ctx_handle) = Context::with_timeout(Duration::from_millis(100));
         let now = Instant::now();
-        let mut response1 = Ok(None);
-        let mut response2 = Ok(None);
+        let mut response = Ok(None);
         scope(|scope| {
-            scope.spawn({
-                let ctx = ctx.clone();
-                |_| {
-                    response1 = client.read_setting_ctx(group, name, ctx);
-                }
-            });
             scope.spawn(|_| {
-                response2 = client.read_setting_ctx(group, name, ctx);
+                response = client.read_setting_ctx(group, name, ctx);
             });
         })
         .unwrap();
         assert!(now.elapsed().as_millis() >= 100);
-        assert!(matches!(response1, Err(Error::TimedOut)));
-        assert!(matches!(response2, Err(Error::TimedOut)));
+        assert!(matches!(response, Err(Error::TimedOut)));
     }
 
     #[test]
@@ -590,28 +583,20 @@ mod tests {
         let (group, name) = ("sbp", "obs_msg_max_size");
         let mock = Mock::new();
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let (ctx, ctx_handle) = Context::new();
         let now = Instant::now();
-        let mut response1 = Ok(None);
-        let mut response2 = Ok(None);
+        let mut response = Ok(None);
         scope(|scope| {
-            scope.spawn({
-                let ctx = ctx.clone();
-                |_| {
-                    response1 = client.read_setting_ctx(group, name, ctx);
-                }
-            });
             scope.spawn(|_| {
-                response2 = client.read_setting_ctx(group, name, ctx);
+                response = client.read_setting_ctx(group, name, ctx);
             });
             std::thread::sleep(Duration::from_millis(100));
             ctx_handle.cancel();
         })
         .unwrap();
         assert!(now.elapsed().as_millis() >= 100);
-        assert!(matches!(response1, Err(Error::Canceled)));
-        assert!(matches!(response2, Err(Error::Canceled)));
+        assert!(matches!(response, Err(Error::Canceled)));
     }
 
     #[test]
@@ -629,7 +614,7 @@ mod tests {
             },
         );
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
         assert!(matches!(response.value, Some(SettingValue::Integer(10))));
     }
@@ -649,7 +634,7 @@ mod tests {
             },
         );
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
         assert!(matches!(response.value, Some(SettingValue::Boolean(true))));
     }
@@ -669,7 +654,7 @@ mod tests {
             },
         );
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
         assert_eq!(response.value, Some(SettingValue::Float(0.1)));
     }
@@ -689,7 +674,7 @@ mod tests {
             },
         );
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
         assert_eq!(response.value, Some(SettingValue::String("foo".into())));
     }
@@ -709,7 +694,7 @@ mod tests {
             },
         );
         let (reader, writer) = mock.into_io();
-        let client = Client::new(reader, writer);
+        let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
         assert_eq!(
             response.value,
