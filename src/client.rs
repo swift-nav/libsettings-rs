@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    convert::TryFrom,
     io,
     sync::{
         atomic::{AtomicU16, AtomicUsize, Ordering},
@@ -13,15 +14,16 @@ use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::thread;
 use parking_lot::Mutex;
 use sbp::{
-    link::{Key, Link, LinkSource},
+    link::{Link, LinkSource},
     messages::settings::{
         MsgSettingsReadByIndexDone, MsgSettingsReadByIndexReq, MsgSettingsReadByIndexResp,
         MsgSettingsReadReq, MsgSettingsReadResp, MsgSettingsWrite, MsgSettingsWriteResp,
     },
-    Sbp, SbpIterExt,
+    sbp_string::Multipart,
+    Sbp, SbpIterExt, SbpString,
 };
 
-use crate::{Setting, SettingKind, SettingValue};
+use crate::{Setting, SettingValue};
 
 const SENDER_ID: u16 = 0x42;
 const NUM_WORKERS: usize = 10;
@@ -30,14 +32,6 @@ pub struct Client<'a> {
     link: Link<'a, ()>,
     sender: MsgSender,
     handle: Option<JoinHandle<()>>,
-    done_rx: Receiver<()>,
-    done_key: Key,
-}
-
-impl Drop for Client<'_> {
-    fn drop(&mut self) {
-        self.link.unregister(self.done_key);
-    }
 }
 
 impl<'a> Client<'a> {
@@ -63,14 +57,10 @@ impl<'a> Client<'a> {
     where
         F: FnMut(Sbp) -> Result<(), BoxedError> + Send + 'static,
     {
-        let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
-        let done_key = link.register(on_read_by_index_done(done_tx));
         Self {
             link,
             sender: MsgSender(Arc::new(Mutex::new(Box::new(sender)))),
             handle: None,
-            done_rx,
-            done_key,
         }
     }
 
@@ -79,7 +69,7 @@ impl<'a> Client<'a> {
         group: impl Into<String>,
         name: impl Into<String>,
         value: impl Into<String>,
-    ) -> Result<(), Error<WriteSettingError>> {
+    ) -> Result<Entry, Error> {
         let (ctx, _ctx_handle) = Context::new();
         self.write_setting_ctx(group, name, value, ctx)
     }
@@ -90,7 +80,7 @@ impl<'a> Client<'a> {
         name: impl Into<String>,
         value: impl Into<String>,
         ctx: Context,
-    ) -> Result<(), Error<WriteSettingError>> {
+    ) -> Result<Entry, Error> {
         self.write_setting_inner(group.into(), name.into(), value.into(), ctx)
     }
 
@@ -98,7 +88,7 @@ impl<'a> Client<'a> {
         &self,
         group: impl Into<String>,
         name: impl Into<String>,
-    ) -> Result<Option<ReadResp>, Error<ReadSettingError>> {
+    ) -> Result<Option<Entry>, Error> {
         let (ctx, _ctx_handle) = Context::new();
         self.read_setting_ctx(group, name, ctx)
     }
@@ -108,20 +98,26 @@ impl<'a> Client<'a> {
         group: impl Into<String>,
         name: impl Into<String>,
         ctx: Context,
-    ) -> Result<Option<ReadResp>, Error<ReadSettingError>> {
+    ) -> Result<Option<Entry>, Error> {
         self.read_setting_inner(group.into(), name.into(), ctx)
     }
 
-    pub fn read_all(&self) -> (Vec<ReadResp>, Vec<Error<ReadSettingError>>) {
+    pub fn read_all(&self) -> (Vec<Entry>, Vec<Error>) {
         let (ctx, _ctx_handle) = Context::new();
         self.read_all_ctx(ctx)
     }
 
-    pub fn read_all_ctx(&self, ctx: Context) -> (Vec<ReadResp>, Vec<Error<ReadSettingError>>) {
+    pub fn read_all_ctx(&self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
         self.read_all_inner(ctx)
     }
 
-    fn read_all_inner(&self, ctx: Context) -> (Vec<ReadResp>, Vec<Error<ReadSettingError>>) {
+    fn read_all_inner(&self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
+        let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
+        let done_key = self.link.register(move |_: MsgSettingsReadByIndexDone| {
+            for _ in 0..NUM_WORKERS {
+                let _ = done_tx.try_send(());
+            }
+        });
         let (settings, errors) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
         let idx = AtomicU16::new(0);
         thread::scope(|scope| {
@@ -129,10 +125,11 @@ impl<'a> Client<'a> {
                 let idx = &idx;
                 let settings = &settings;
                 let errors = &errors;
+                let done_rx = &done_rx;
                 let ctx = ctx.clone();
                 scope.spawn(move |_| loop {
                     let idx = idx.fetch_add(1, Ordering::SeqCst);
-                    match self.read_by_index(idx, &ctx) {
+                    match self.read_by_index(idx, done_rx, &ctx) {
                         Ok(Some(setting)) => {
                             settings.lock().push((idx, setting));
                         }
@@ -149,6 +146,7 @@ impl<'a> Client<'a> {
             }
         })
         .expect("read_all worker thread panicked");
+        self.link.unregister(done_key);
         settings.lock().sort_by_key(|(idx, _)| *idx);
         errors.lock().sort_by_key(|(idx, _)| *idx);
         (
@@ -159,18 +157,24 @@ impl<'a> Client<'a> {
 
     fn read_by_index(
         &self,
-        idx: u16,
+        index: u16,
+        done_rx: &Receiver<()>,
         ctx: &Context,
-    ) -> Result<Option<ReadResp>, Error<ReadSettingError>> {
+    ) -> Result<Option<Entry>, Error> {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register(on_read_by_index_resp(tx, idx));
+        let key = self.link.register(move |msg: MsgSettingsReadByIndexResp| {
+            if index != msg.index {
+                return;
+            }
+            let _ = tx.try_send(Entry::try_from(msg));
+        });
         self.sender.send(MsgSettingsReadByIndexReq {
             sender_id: Some(SENDER_ID),
-            index: idx,
+            index,
         })?;
         let res = crossbeam_channel::select! {
-            recv(rx) -> msg => Ok(Some(msg.unwrap())),
-            recv(self.done_rx) -> _ => Ok(None),
+            recv(rx) -> msg => msg.unwrap().map(Some),
+            recv(done_rx) -> _ => Ok(None),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
             recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
         };
@@ -183,17 +187,31 @@ impl<'a> Client<'a> {
         group: String,
         name: String,
         ctx: Context,
-    ) -> Result<Option<ReadResp>, Error<ReadSettingError>> {
+    ) -> Result<Option<Entry>, Error> {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self
-            .link
-            .register(on_read_resp(tx, group.clone(), name.clone()));
+        let key = self.link.register({
+            let group = group.clone();
+            let name = name.clone();
+            move |msg: MsgSettingsReadResp| {
+                let fields = split_multipart(&msg.setting);
+                if fields.len() < 2 || fields[0] != group || fields[1] != name {
+                    return;
+                }
+                let _ = tx.send(Entry::try_from(msg).map(|e| {
+                    if e.value.is_some() {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }));
+            }
+        });
         self.sender.send(MsgSettingsReadReq {
             sender_id: Some(SENDER_ID),
             setting: format!("{}\0{}\0", group, name).into(),
         })?;
         let res = crossbeam_channel::select! {
-            recv(rx) -> msg => Ok(msg.unwrap()),
+            recv(rx) -> msg => msg.unwrap(),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
             recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
         };
@@ -207,11 +225,24 @@ impl<'a> Client<'a> {
         name: String,
         value: String,
         ctx: Context,
-    ) -> Result<(), Error<WriteSettingError>> {
+    ) -> Result<Entry, Error> {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self
-            .link
-            .register(on_write_resp(tx, group.clone(), name.clone()));
+        let key = self.link.register({
+            let group = group.clone();
+            let name = name.clone();
+            move |msg: MsgSettingsWriteResp| {
+                let fields = split_multipart(&msg.setting);
+                if fields.len() < 2 || fields[0] != group || fields[1] != name {
+                    return;
+                }
+                if msg.status != 0 {
+                    let e = Error::WriteError(WriteSettingError::from(msg.status));
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+                let _ = tx.send(Entry::try_from(msg));
+            }
+        });
         self.sender.send(MsgSettingsWrite {
             sender_id: Some(SENDER_ID),
             setting: format!("{}\0{}\0{}\0", group, name, value).into(),
@@ -226,91 +257,82 @@ impl<'a> Client<'a> {
     }
 }
 
-fn on_read_by_index_done(tx: Sender<()>) -> impl FnMut(MsgSettingsReadByIndexDone) {
-    move |_: MsgSettingsReadByIndexDone| {
-        for _ in 0..NUM_WORKERS {
-            let _ = tx.try_send(());
-        }
-    }
-}
-
-fn on_write_resp(
-    tx: Sender<Result<(), Error<WriteSettingError>>>,
-    group: String,
-    name: String,
-) -> impl FnMut(MsgSettingsWriteResp) {
-    move |msg: MsgSettingsWriteResp| {
-        let setting = msg.setting.to_string();
-        let mut fields = setting.split('\0');
-        if fields.next() == Some(&group) && fields.next() == Some(&name) {
-            if msg.status == 0 {
-                let _ = tx.send(Ok(()));
-            } else {
-                let _ = tx.send(Err(Error::Err(WriteSettingError::from(msg.status))));
-            }
-        }
-    }
-}
-
-fn on_read_resp(
-    tx: Sender<Option<ReadResp>>,
-    group: String,
-    name: String,
-) -> impl FnMut(MsgSettingsReadResp) {
-    move |msg: MsgSettingsReadResp| {
-        let setting = msg.setting.to_string();
-        let mut fields = setting.split('\0');
-        if fields.next() == Some(&group) && fields.next() == Some(&name) {
-            let entry = Setting::find(&group, &name).map_or_else(
-                || Cow::Owned(Setting::unknown(group.clone(), name.clone())),
-                Cow::Borrowed,
-            );
-            match fields.next() {
-                Some(v) => {
-                    let value = SettingValue::parse(v, entry.kind);
-                    let _ = tx.try_send(Some(ReadResp { entry, value }));
-                }
-                None => {
-                    let _ = tx.try_send(None);
-                }
-            }
-        }
-    }
-}
-
-fn on_read_by_index_resp(tx: Sender<ReadResp>, idx: u16) -> impl FnMut(MsgSettingsReadByIndexResp) {
-    move |msg: MsgSettingsReadByIndexResp| {
-        if idx != msg.index {
-            return;
-        }
-        let setting = msg.setting.to_string();
-        let mut fields = setting.split('\0');
-        let group = fields.next().unwrap_or_default();
-        let name = fields.next().unwrap_or_default();
-        let mut entry = Setting::find(&group, &name).map_or_else(
-            || Cow::Owned(Setting::unknown(group.to_owned(), name.to_owned())),
-            Cow::Borrowed,
-        );
-        let value = fields
-            .next()
-            .and_then(|s| SettingValue::parse(s, entry.kind));
-        if entry.kind == SettingKind::Enum {
-            if let Some(fmt_type) = fields.next() {
-                let mut parts = fmt_type.splitn(2, ':');
-                let possible_values = parts.nth(1);
-                if let Some(p) = possible_values {
-                    entry.to_mut().enumerated_possible_values = Some(p.to_owned());
-                }
-            }
-        }
-        let _ = tx.try_send(ReadResp { entry, value });
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
-pub struct ReadResp {
-    pub entry: Cow<'static, Setting>,
+pub struct Entry {
+    pub setting: Cow<'static, Setting>,
     pub value: Option<SettingValue>,
+}
+
+impl TryFrom<MsgSettingsWriteResp> for Entry {
+    type Error = Error;
+
+    fn try_from(msg: MsgSettingsWriteResp) -> Result<Self, Self::Error> {
+        let fields = split_multipart(&msg.setting);
+        if let [group, name, value] = fields.as_slice() {
+            let setting = Setting::new(group, name);
+            let value = SettingValue::parse(value, setting.kind);
+            Ok(Entry { setting, value })
+        } else {
+            Err(Error::ParseError)
+        }
+    }
+}
+
+impl TryFrom<MsgSettingsReadResp> for Entry {
+    type Error = Error;
+
+    fn try_from(msg: MsgSettingsReadResp) -> Result<Self, Self::Error> {
+        let fields = split_multipart(&msg.setting);
+        match fields.as_slice() {
+            [group, name] => {
+                let setting = Setting::new(&group, &name);
+                Ok(Entry {
+                    setting,
+                    value: None,
+                })
+            }
+            [group, name, value] | [group, name, value, ..] => {
+                let setting = Setting::new(&group, &name);
+                let value = SettingValue::parse(value, setting.kind);
+                Ok(Entry { setting, value })
+            }
+            _ => Err(Error::ParseError),
+        }
+    }
+}
+
+impl TryFrom<MsgSettingsReadByIndexResp> for Entry {
+    type Error = Error;
+
+    fn try_from(msg: MsgSettingsReadByIndexResp) -> Result<Self, Self::Error> {
+        let fields = split_multipart(&msg.setting);
+        match fields.as_slice() {
+            [group, name, value, fmt_type] => {
+                let setting = if fmt_type.is_empty() {
+                    Setting::new(group, name)
+                } else {
+                    Setting::with_fmt_type(group, name, fmt_type)
+                };
+                let value = if !value.is_empty() {
+                    SettingValue::parse(value, setting.kind)
+                } else {
+                    None
+                };
+                Ok(Entry { setting, value })
+            }
+            _ => Err(Error::ParseError),
+        }
+    }
+}
+
+fn split_multipart(s: &SbpString<Vec<u8>, Multipart>) -> Vec<Cow<'_, str>> {
+    let mut parts: Vec<_> = s
+        .as_bytes()
+        .split(|b| *b == 0)
+        .map(String::from_utf8_lossy)
+        .collect();
+    parts.pop();
+    parts
 }
 
 pub struct Context {
@@ -421,34 +443,33 @@ impl MsgSender {
 }
 
 #[derive(Debug)]
-pub enum Error<E> {
-    Err(E),
+pub enum Error {
     SenderError(BoxedError),
+    WriteError(WriteSettingError),
+    ParseError,
     TimedOut,
     Canceled,
 }
 
-impl<E> From<BoxedError> for Error<E> {
+impl From<BoxedError> for Error {
     fn from(v: BoxedError) -> Self {
         Self::SenderError(v)
     }
 }
 
-impl<E> std::fmt::Display for Error<E>
-where
-    E: std::error::Error,
-{
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Err(err) => write!(f, "{}", err),
+            Error::SenderError(err) => write!(f, "{}", err),
+            Error::WriteError(err) => write!(f, "{}", err),
+            Error::ParseError => write!(f, "failed to parse setting"),
             Error::TimedOut => write!(f, "timed out"),
             Error::Canceled => write!(f, "canceled"),
-            Error::SenderError(err) => write!(f, "{}", err),
         }
     }
 }
 
-impl<E> std::error::Error for Error<E> where E: std::error::Error {}
+impl std::error::Error for Error {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteSettingError {
@@ -505,17 +526,6 @@ impl std::fmt::Display for WriteSettingError {
 }
 
 impl std::error::Error for WriteSettingError {}
-
-#[derive(Debug)]
-pub struct ReadSettingError {}
-
-impl std::fmt::Display for ReadSettingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "settings read failed")
-    }
-}
-
-impl std::error::Error for ReadSettingError {}
 
 #[cfg(test)]
 mod tests {

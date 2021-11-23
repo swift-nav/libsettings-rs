@@ -1,4 +1,4 @@
-use std::{fmt, fs, io, path::Path};
+use std::{borrow::Cow, fmt, fs, io, path::Path};
 
 use log::warn;
 use once_cell::sync::OnceCell;
@@ -79,16 +79,39 @@ impl Setting {
             .find(|s| s.group == group && s.name == name)
     }
 
-    pub(crate) fn unknown(group: String, name: String) -> Setting {
-        warn!(
-            "No settings documentation entry or name: {} in group: {}",
-            name, group
-        );
-        Setting {
-            group,
-            name,
-            ..Default::default()
+    pub(crate) fn new(group: impl AsRef<str>, name: impl AsRef<str>) -> Cow<'static, Setting> {
+        Setting::find(&group, &name).map_or_else(
+            || {
+                let group = group.as_ref().to_owned();
+                let name = name.as_ref().to_owned();
+                warn!(
+                    "No settings documentation entry or name: {} in group: {}",
+                    name, group
+                );
+                Cow::Owned(Setting {
+                    group,
+                    name,
+                    ..Default::default()
+                })
+            },
+            Cow::Borrowed,
+        )
+    }
+
+    pub(crate) fn with_fmt_type(
+        group: impl AsRef<str>,
+        name: impl AsRef<str>,
+        fmt_type: impl AsRef<str>,
+    ) -> Cow<'static, Setting> {
+        let mut setting = Setting::new(group, name);
+        if setting.kind == SettingKind::Enum {
+            let mut parts = fmt_type.as_ref().splitn(2, ':');
+            let possible_values = parts.nth(1);
+            if let Some(p) = possible_values {
+                setting.to_mut().enumerated_possible_values = Some(p.to_owned());
+            }
         }
+        setting
     }
 }
 
