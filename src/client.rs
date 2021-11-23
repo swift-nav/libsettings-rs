@@ -14,7 +14,7 @@ use crossbeam_utils::thread;
 use log::warn;
 use parking_lot::Mutex;
 use sbp::{
-    link::{Link, LinkSource},
+    link::{Key, Link, LinkSource},
     messages::settings::{
         MsgSettingsReadByIndexDone, MsgSettingsReadByIndexReq, MsgSettingsReadByIndexResp,
         MsgSettingsReadReq, MsgSettingsReadResp, MsgSettingsWrite, MsgSettingsWriteResp,
@@ -31,6 +31,14 @@ pub struct Client<'a> {
     link: Link<'a, ()>,
     sender: MsgSender,
     handle: Option<JoinHandle<()>>,
+    done_rx: Receiver<()>,
+    key: Key,
+}
+
+impl Drop for Client<'_> {
+    fn drop(&mut self) {
+        self.link.unregister(self.key);
+    }
 }
 
 impl<'a> Client<'a> {
@@ -56,10 +64,14 @@ impl<'a> Client<'a> {
     where
         F: FnMut(Sbp) -> Result<(), BoxedError> + Send + 'static,
     {
+        let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
+        let key = link.register(on_read_by_index_done(done_tx));
         Self {
             link,
             sender: MsgSender(Arc::new(Mutex::new(Box::new(sender)))),
             handle: None,
+            done_rx,
+            key,
         }
     }
 
@@ -111,15 +123,6 @@ impl<'a> Client<'a> {
     }
 
     fn read_all_inner(&self, ctx: Context) -> (Vec<ReadResp>, Vec<Error<ReadSettingError>>) {
-        let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
-        let key = self.link.register(move |_: MsgSettingsReadByIndexDone| {
-            if !done_tx.is_empty() {
-                return;
-            }
-            for _ in 0..NUM_WORKERS {
-                done_tx.try_send(()).unwrap();
-            }
-        });
         let (settings, errors) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
         let idx = AtomicU16::new(0);
         thread::scope(|scope| {
@@ -127,15 +130,26 @@ impl<'a> Client<'a> {
                 let idx = &idx;
                 let settings = &settings;
                 let errors = &errors;
-                let done_rx = &done_rx;
                 let ctx = ctx.clone();
-                scope.spawn(move |_| {
-                    self.worker_thd(idx, settings, errors, done_rx, ctx);
+                scope.spawn(move |_| loop {
+                    let idx = idx.fetch_add(1, Ordering::SeqCst);
+                    match self.read_by_index(idx, &ctx) {
+                        Ok(Some(setting)) => {
+                            settings.lock().push((idx, setting));
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let exit = matches!(err, Error::TimedOut | Error::Canceled);
+                            errors.lock().push((idx, err));
+                            if exit {
+                                break;
+                            }
+                        }
+                    }
                 });
             }
         })
         .expect("read_all worker thread panicked");
-        self.link.unregister(key);
         settings.lock().sort_by_key(|(idx, _)| *idx);
         errors.lock().sort_by_key(|(idx, _)| *idx);
         (
@@ -144,97 +158,20 @@ impl<'a> Client<'a> {
         )
     }
 
-    fn worker_thd(
-        &self,
-        idx: &AtomicU16,
-        settings: &Mutex<Vec<(u16, ReadResp)>>,
-        errors: &Mutex<Vec<(u16, Error<ReadSettingError>)>>,
-        done_rx: &Receiver<()>,
-        ctx: Context,
-    ) {
-        loop {
-            let idx = idx.fetch_add(1, Ordering::SeqCst);
-            match self.read_by_index(idx, done_rx, &ctx) {
-                Ok(Some(setting)) => {
-                    settings.lock().push((idx, setting));
-                }
-                Ok(None) => {
-                    break;
-                }
-                Err(err) => {
-                    let exit = matches!(err, Error::TimedOut | Error::Canceled);
-                    errors.lock().push((idx, err));
-                    if exit {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     fn read_by_index(
         &self,
         idx: u16,
-        done_rx: &Receiver<()>,
         ctx: &Context,
     ) -> Result<Option<ReadResp>, Error<ReadSettingError>> {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register(move |msg: MsgSettingsReadByIndexResp| {
-            if idx != msg.index {
-                return;
-            }
-            let setting = msg.setting.to_string();
-            let mut fields = setting.split('\0');
-            let group = fields.next().unwrap_or_default();
-            let name = fields.next().unwrap_or_default();
-            let entry = Setting::find(group, name);
-            if let Some(entry) = entry {
-                let value = fields
-                    .next()
-                    .and_then(|s| SettingValue::parse(s, entry.kind));
-                let fmt_type = fields.next();
-                if entry.kind == SettingKind::Enum {
-                    if let Some(fmt_type) = fmt_type {
-                        let mut parts = fmt_type.splitn(2, ':');
-                        let possible_values = parts.nth(1);
-                        if let Some(p) = possible_values {
-                            let mut entry = entry.clone();
-                            entry.enumerated_possible_values = Some(p.to_owned());
-                            let _ = tx.send(ReadResp {
-                                entry: Cow::Owned(entry),
-                                value,
-                            });
-                            return;
-                        }
-                    }
-                }
-                let _ = tx.send(ReadResp {
-                    entry: Cow::Borrowed(entry),
-                    value,
-                });
-            } else {
-                warn!(
-                    "No settings documentation entry or name: {} in group: {}",
-                    name, group
-                );
-                let entry: Cow<Setting> = Cow::Owned(Setting {
-                    group: group.to_owned(),
-                    name: name.to_owned(),
-                    ..Default::default()
-                });
-                let value = fields
-                    .next()
-                    .and_then(|s| SettingValue::parse(s, entry.kind));
-                let _ = tx.send(ReadResp { entry, value });
-            }
-        });
+        let key = self.link.register(on_read_by_index_resp(idx, tx));
         self.sender.send(MsgSettingsReadByIndexReq {
             sender_id: Some(SENDER_ID),
             index: idx,
         })?;
         let res = crossbeam_channel::select! {
             recv(rx) -> msg => Ok(Some(msg.unwrap())),
-            recv(done_rx) -> _ => Ok(None),
+            recv(self.done_rx) -> _ => Ok(None),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
             recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
         };
@@ -257,23 +194,7 @@ impl<'a> Client<'a> {
             setting: format!("{}\0{}\0", group, name).into(),
         };
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register(move |msg: MsgSettingsReadResp| {
-            let setting = msg.setting.to_string();
-            let mut fields = setting.split('\0');
-            if fields.next() == Some(&group) && fields.next() == Some(&name) {
-                match fields.next() {
-                    Some(value) => {
-                        let _ = tx.try_send(Some(ReadResp {
-                            entry: Cow::Borrowed(entry),
-                            value: SettingValue::parse(value, entry.kind),
-                        }));
-                    }
-                    None => {
-                        let _ = tx.try_send(None);
-                    }
-                }
-            }
-        });
+        let key = self.link.register(on_read_resp(group, name, tx, entry));
         self.sender.send(read_req)?;
         let res = crossbeam_channel::select! {
             recv(rx) -> msg => Ok(msg.unwrap()),
@@ -296,17 +217,7 @@ impl<'a> Client<'a> {
             setting: format!("{}\0{}\0{}\0", group, name, value).into(),
         };
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register(move |msg: MsgSettingsWriteResp| {
-            let setting = msg.setting.to_string();
-            let mut fields = setting.split('\0');
-            if fields.next() == Some(&group) && fields.next() == Some(&name) {
-                if msg.status == 0 {
-                    let _ = tx.send(Ok(()));
-                } else {
-                    let _ = tx.send(Err(Error::Err(WriteSettingError::from(msg.status))));
-                }
-            }
-        });
+        let key = self.link.register(on_write_resp(group, name, tx));
         self.sender.send(write_req)?;
         let res = crossbeam_channel::select! {
             recv(rx) -> msg => msg.unwrap(),
@@ -315,6 +226,109 @@ impl<'a> Client<'a> {
         };
         self.link.unregister(key);
         res
+    }
+}
+
+fn on_read_by_index_done(done_tx: Sender<()>) -> impl FnMut(MsgSettingsReadByIndexDone) {
+    move |_: MsgSettingsReadByIndexDone| {
+        for _ in 0..NUM_WORKERS {
+            let _ = done_tx.try_send(());
+        }
+    }
+}
+
+fn on_write_resp(
+    group: String,
+    name: String,
+    tx: Sender<Result<(), Error<WriteSettingError>>>,
+) -> impl FnMut(MsgSettingsWriteResp) {
+    move |msg: MsgSettingsWriteResp| {
+        let setting = msg.setting.to_string();
+        let mut fields = setting.split('\0');
+        if fields.next() == Some(&group) && fields.next() == Some(&name) {
+            if msg.status == 0 {
+                let _ = tx.send(Ok(()));
+            } else {
+                let _ = tx.send(Err(Error::Err(WriteSettingError::from(msg.status))));
+            }
+        }
+    }
+}
+
+fn on_read_resp(
+    group: String,
+    name: String,
+    tx: Sender<Option<ReadResp>>,
+    entry: &'static Setting,
+) -> impl FnMut(MsgSettingsReadResp) {
+    move |msg: MsgSettingsReadResp| {
+        let setting = msg.setting.to_string();
+        let mut fields = setting.split('\0');
+        if fields.next() == Some(&group) && fields.next() == Some(&name) {
+            match fields.next() {
+                Some(value) => {
+                    let _ = tx.try_send(Some(ReadResp {
+                        entry: Cow::Borrowed(entry),
+                        value: SettingValue::parse(value, entry.kind),
+                    }));
+                }
+                None => {
+                    let _ = tx.try_send(None);
+                }
+            }
+        }
+    }
+}
+
+fn on_read_by_index_resp(idx: u16, tx: Sender<ReadResp>) -> impl FnMut(MsgSettingsReadByIndexResp) {
+    move |msg: MsgSettingsReadByIndexResp| {
+        if idx != msg.index {
+            return;
+        }
+        let setting = msg.setting.to_string();
+        let mut fields = setting.split('\0');
+        let group = fields.next().unwrap_or_default();
+        let name = fields.next().unwrap_or_default();
+        let entry = Setting::find(group, name);
+        if let Some(entry) = entry {
+            let value = fields
+                .next()
+                .and_then(|s| SettingValue::parse(s, entry.kind));
+            let fmt_type = fields.next();
+            if entry.kind == SettingKind::Enum {
+                if let Some(fmt_type) = fmt_type {
+                    let mut parts = fmt_type.splitn(2, ':');
+                    let possible_values = parts.nth(1);
+                    if let Some(p) = possible_values {
+                        let mut entry = entry.clone();
+                        entry.enumerated_possible_values = Some(p.to_owned());
+                        let _ = tx.send(ReadResp {
+                            entry: Cow::Owned(entry),
+                            value,
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(ReadResp {
+                entry: Cow::Borrowed(entry),
+                value,
+            });
+        } else {
+            warn!(
+                "No settings documentation entry or name: {} in group: {}",
+                name, group
+            );
+            let entry: Cow<Setting> = Cow::Owned(Setting {
+                group: group.to_owned(),
+                name: name.to_owned(),
+                ..Default::default()
+            });
+            let value = fields
+                .next()
+                .and_then(|s| SettingValue::parse(s, entry.kind));
+            let _ = tx.send(ReadResp { entry, value });
+        }
     }
 }
 
@@ -414,7 +428,7 @@ struct MsgSender(Arc<Mutex<SenderFunc>>);
 
 impl MsgSender {
     const RETRIES: usize = 5;
-    const TIMEOUT: Duration = Duration::from_millis(500);
+    const TIMEOUT: Duration = Duration::from_millis(100);
 
     fn send(&self, msg: impl Into<Sbp>) -> Result<(), BoxedError> {
         self.send_inner(msg.into(), 0)
