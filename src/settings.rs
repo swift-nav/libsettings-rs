@@ -23,7 +23,7 @@ pub fn load(settings: Vec<Setting>) -> Result<(), Vec<Setting>> {
     SETTINGS.set(settings)
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 pub struct Setting {
     pub name: String,
 
@@ -103,6 +103,12 @@ pub enum SettingKind {
     PackedBitfield,
 }
 
+impl Default for SettingKind {
+    fn default() -> Self {
+        SettingKind::String
+    }
+}
+
 impl SettingKind {
     pub fn to_str(&self) -> &'static str {
         match self {
@@ -123,6 +129,21 @@ pub enum SettingValue {
     Boolean(bool),
     Float(f32),
     String(String),
+}
+
+impl SettingValue {
+    pub fn parse(v: &str, kind: SettingKind) -> Option<Self> {
+        match kind {
+            SettingKind::Integer => v.parse().ok().map(SettingValue::Integer),
+            SettingKind::Boolean if v == "True" => Some(SettingValue::Boolean(true)),
+            SettingKind::Boolean if v == "False" => Some(SettingValue::Boolean(false)),
+            SettingKind::Float | SettingKind::Double => v.parse().ok().map(SettingValue::Float),
+            SettingKind::String | SettingKind::Enum | SettingKind::PackedBitfield => {
+                Some(SettingValue::String(v.to_owned()))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SettingValue {

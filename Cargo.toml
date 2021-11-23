@@ -31,7 +31,3 @@ serde_yaml = "0.8"
 
 [dev-dependencies]
 mockstream = { git = "https://github.com/lazy-bitfield/rust-mockstream", rev = "0.0.4" }
-
-[build-dependencies]
-cmake = "0.1"
-bindgen = "0.59"
