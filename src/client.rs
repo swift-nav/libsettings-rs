@@ -11,7 +11,6 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::thread;
-use log::warn;
 use parking_lot::Mutex;
 use sbp::{
     link::{Key, Link, LinkSource},
@@ -32,12 +31,12 @@ pub struct Client<'a> {
     sender: MsgSender,
     handle: Option<JoinHandle<()>>,
     done_rx: Receiver<()>,
-    key: Key,
+    done_key: Key,
 }
 
 impl Drop for Client<'_> {
     fn drop(&mut self) {
-        self.link.unregister(self.key);
+        self.link.unregister(self.done_key);
     }
 }
 
@@ -65,13 +64,13 @@ impl<'a> Client<'a> {
         F: FnMut(Sbp) -> Result<(), BoxedError> + Send + 'static,
     {
         let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
-        let key = link.register(on_read_by_index_done(done_tx));
+        let done_key = link.register(on_read_by_index_done(done_tx));
         Self {
             link,
             sender: MsgSender(Arc::new(Mutex::new(Box::new(sender)))),
             handle: None,
             done_rx,
-            key,
+            done_key,
         }
     }
 
@@ -164,7 +163,7 @@ impl<'a> Client<'a> {
         ctx: &Context,
     ) -> Result<Option<ReadResp>, Error<ReadSettingError>> {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register(on_read_by_index_resp(idx, tx));
+        let key = self.link.register(on_read_by_index_resp(tx, idx));
         self.sender.send(MsgSettingsReadByIndexReq {
             sender_id: Some(SENDER_ID),
             index: idx,
@@ -185,17 +184,14 @@ impl<'a> Client<'a> {
         name: String,
         ctx: Context,
     ) -> Result<Option<ReadResp>, Error<ReadSettingError>> {
-        let entry = match Setting::find(&group, &name) {
-            Some(setting) => setting,
-            None => return Ok(None),
-        };
-        let read_req = MsgSettingsReadReq {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let key = self
+            .link
+            .register(on_read_resp(tx, group.clone(), name.clone()));
+        self.sender.send(MsgSettingsReadReq {
             sender_id: Some(SENDER_ID),
             setting: format!("{}\0{}\0", group, name).into(),
-        };
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register(on_read_resp(group, name, tx, entry));
-        self.sender.send(read_req)?;
+        })?;
         let res = crossbeam_channel::select! {
             recv(rx) -> msg => Ok(msg.unwrap()),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
@@ -212,13 +208,14 @@ impl<'a> Client<'a> {
         value: String,
         ctx: Context,
     ) -> Result<(), Error<WriteSettingError>> {
-        let write_req = MsgSettingsWrite {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let key = self
+            .link
+            .register(on_write_resp(tx, group.clone(), name.clone()));
+        self.sender.send(MsgSettingsWrite {
             sender_id: Some(SENDER_ID),
             setting: format!("{}\0{}\0{}\0", group, name, value).into(),
-        };
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register(on_write_resp(group, name, tx));
-        self.sender.send(write_req)?;
+        })?;
         let res = crossbeam_channel::select! {
             recv(rx) -> msg => msg.unwrap(),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
@@ -229,18 +226,18 @@ impl<'a> Client<'a> {
     }
 }
 
-fn on_read_by_index_done(done_tx: Sender<()>) -> impl FnMut(MsgSettingsReadByIndexDone) {
+fn on_read_by_index_done(tx: Sender<()>) -> impl FnMut(MsgSettingsReadByIndexDone) {
     move |_: MsgSettingsReadByIndexDone| {
         for _ in 0..NUM_WORKERS {
-            let _ = done_tx.try_send(());
+            let _ = tx.try_send(());
         }
     }
 }
 
 fn on_write_resp(
+    tx: Sender<Result<(), Error<WriteSettingError>>>,
     group: String,
     name: String,
-    tx: Sender<Result<(), Error<WriteSettingError>>>,
 ) -> impl FnMut(MsgSettingsWriteResp) {
     move |msg: MsgSettingsWriteResp| {
         let setting = msg.setting.to_string();
@@ -256,21 +253,22 @@ fn on_write_resp(
 }
 
 fn on_read_resp(
+    tx: Sender<Option<ReadResp>>,
     group: String,
     name: String,
-    tx: Sender<Option<ReadResp>>,
-    entry: &'static Setting,
 ) -> impl FnMut(MsgSettingsReadResp) {
     move |msg: MsgSettingsReadResp| {
         let setting = msg.setting.to_string();
         let mut fields = setting.split('\0');
         if fields.next() == Some(&group) && fields.next() == Some(&name) {
+            let entry = Setting::find(&group, &name).map_or_else(
+                || Cow::Owned(Setting::unknown(group.clone(), name.clone())),
+                Cow::Borrowed,
+            );
             match fields.next() {
-                Some(value) => {
-                    let _ = tx.try_send(Some(ReadResp {
-                        entry: Cow::Borrowed(entry),
-                        value: SettingValue::parse(value, entry.kind),
-                    }));
+                Some(v) => {
+                    let value = SettingValue::parse(v, entry.kind);
+                    let _ = tx.try_send(Some(ReadResp { entry, value }));
                 }
                 None => {
                     let _ = tx.try_send(None);
@@ -280,7 +278,7 @@ fn on_read_resp(
     }
 }
 
-fn on_read_by_index_resp(idx: u16, tx: Sender<ReadResp>) -> impl FnMut(MsgSettingsReadByIndexResp) {
+fn on_read_by_index_resp(tx: Sender<ReadResp>, idx: u16) -> impl FnMut(MsgSettingsReadByIndexResp) {
     move |msg: MsgSettingsReadByIndexResp| {
         if idx != msg.index {
             return;
@@ -289,46 +287,23 @@ fn on_read_by_index_resp(idx: u16, tx: Sender<ReadResp>) -> impl FnMut(MsgSettin
         let mut fields = setting.split('\0');
         let group = fields.next().unwrap_or_default();
         let name = fields.next().unwrap_or_default();
-        let entry = Setting::find(group, name);
-        if let Some(entry) = entry {
-            let value = fields
-                .next()
-                .and_then(|s| SettingValue::parse(s, entry.kind));
-            let fmt_type = fields.next();
-            if entry.kind == SettingKind::Enum {
-                if let Some(fmt_type) = fmt_type {
-                    let mut parts = fmt_type.splitn(2, ':');
-                    let possible_values = parts.nth(1);
-                    if let Some(p) = possible_values {
-                        let mut entry = entry.clone();
-                        entry.enumerated_possible_values = Some(p.to_owned());
-                        let _ = tx.send(ReadResp {
-                            entry: Cow::Owned(entry),
-                            value,
-                        });
-                        return;
-                    }
+        let mut entry = Setting::find(&group, &name).map_or_else(
+            || Cow::Owned(Setting::unknown(group.to_owned(), name.to_owned())),
+            Cow::Borrowed,
+        );
+        let value = fields
+            .next()
+            .and_then(|s| SettingValue::parse(s, entry.kind));
+        if entry.kind == SettingKind::Enum {
+            if let Some(fmt_type) = fields.next() {
+                let mut parts = fmt_type.splitn(2, ':');
+                let possible_values = parts.nth(1);
+                if let Some(p) = possible_values {
+                    entry.to_mut().enumerated_possible_values = Some(p.to_owned());
                 }
             }
-            let _ = tx.send(ReadResp {
-                entry: Cow::Borrowed(entry),
-                value,
-            });
-        } else {
-            warn!(
-                "No settings documentation entry or name: {} in group: {}",
-                name, group
-            );
-            let entry: Cow<Setting> = Cow::Owned(Setting {
-                group: group.to_owned(),
-                name: name.to_owned(),
-                ..Default::default()
-            });
-            let value = fields
-                .next()
-                .and_then(|s| SettingValue::parse(s, entry.kind));
-            let _ = tx.send(ReadResp { entry, value });
         }
+        let _ = tx.try_send(ReadResp { entry, value });
     }
 }
 

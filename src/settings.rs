@@ -1,5 +1,6 @@
 use std::{fmt, fs, io, path::Path};
 
+use log::warn;
 use once_cell::sync::OnceCell;
 use serde::{
     de::{self, Unexpected},
@@ -76,6 +77,18 @@ impl Setting {
         Setting::all()
             .iter()
             .find(|s| s.group == group && s.name == name)
+    }
+
+    pub(crate) fn unknown(group: String, name: String) -> Setting {
+        warn!(
+            "No settings documentation entry or name: {} in group: {}",
+            name, group
+        );
+        Setting {
+            group,
+            name,
+            ..Default::default()
+        }
     }
 }
 
