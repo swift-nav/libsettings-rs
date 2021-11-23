@@ -236,11 +236,6 @@ impl<'a> Client<'a> {
                 if fields.len() < 2 || fields[0] != group || fields[1] != name {
                     return;
                 }
-                if msg.status != 0 {
-                    let e = Error::WriteError(WriteSettingError::from(msg.status));
-                    let _ = tx.send(Err(e));
-                    return;
-                }
                 let _ = tx.send(Entry::try_from(msg));
             }
         });
@@ -268,6 +263,9 @@ impl TryFrom<MsgSettingsWriteResp> for Entry {
     type Error = Error;
 
     fn try_from(msg: MsgSettingsWriteResp) -> Result<Self, Self::Error> {
+        if msg.status != 0 {
+            return Err(Error::WriteError(msg.status.into()));
+        }
         let fields = split_multipart(&msg.setting);
         if let [group, name, value] = fields.as_slice() {
             let setting = Setting::new(group, name);
