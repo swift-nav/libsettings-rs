@@ -1,8 +1,8 @@
-use sbp_settings::{settings, Setting, SettingKind};
+use sbp_settings::{setting, Setting, SettingKind};
 
 #[test]
 fn test_load() {
-    settings::load(vec![Setting {
+    setting::load(vec![Setting {
         name: "aname".into(),
         group: "agroup".into(),
         kind: SettingKind::String,

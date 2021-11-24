@@ -3,14 +3,14 @@ use std::{
     convert::TryFrom,
     io,
     sync::{
-        atomic::{AtomicU16, AtomicUsize, Ordering},
+        atomic::{AtomicU16, Ordering},
         Arc,
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use crossbeam_utils::thread;
 use log::trace;
 use parking_lot::Mutex;
@@ -24,7 +24,9 @@ use sbp::{
     Sbp, SbpIterExt, SbpString,
 };
 
-use crate::{Setting, SettingValue};
+use crate::context::Context;
+use crate::error::{BoxedError, Error};
+use crate::setting::{Setting, SettingValue};
 
 const SENDER_ID: u16 = 0x42;
 const NUM_WORKERS: usize = 10;
@@ -246,11 +248,6 @@ impl<'a> Client<'a> {
     }
 }
 
-fn request_matches(group: &str, name: &str, setting: &SbpString<Vec<u8>, Multipart>) -> bool {
-    let fields = split_multipart(setting);
-    matches!(fields.as_slice(), [g, n, ..] if g == group && n == name)
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub setting: Cow<'static, Setting>,
@@ -322,100 +319,6 @@ impl TryFrom<MsgSettingsReadByIndexResp> for Entry {
     }
 }
 
-fn split_multipart(s: &SbpString<Vec<u8>, Multipart>) -> Vec<Cow<'_, str>> {
-    let mut parts: Vec<_> = s
-        .as_bytes()
-        .split(|b| *b == 0)
-        .map(String::from_utf8_lossy)
-        .collect();
-    parts.pop();
-    parts
-}
-
-pub struct Context {
-    cancel_rx: Receiver<()>,
-    timeout_rx: Receiver<Instant>,
-    timeout_at: Instant,
-    shared: Arc<CtxShared>,
-}
-
-impl Context {
-    pub fn new() -> (Context, CtxHandle) {
-        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded();
-        let timeout_rx = crossbeam_channel::never();
-        let timeout_at = Instant::now() + Duration::from_secs(60 * 60 * 24);
-        let shared = Arc::new(CtxShared::new(cancel_tx));
-        (
-            Context {
-                cancel_rx,
-                timeout_rx,
-                timeout_at,
-                shared: Arc::clone(&shared),
-            },
-            CtxHandle { shared },
-        )
-    }
-
-    pub fn with_timeout(timeout: Duration) -> (Context, CtxHandle) {
-        let (mut ctx, h) = Self::new();
-        ctx.set_timeout(timeout);
-        (ctx, h)
-    }
-
-    pub fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout_at = Instant::now() + timeout;
-        self.timeout_rx = crossbeam_channel::at(self.timeout_at);
-    }
-
-    pub fn cancel(&self) {
-        self.shared.cancel();
-    }
-}
-
-impl Clone for Context {
-    fn clone(&self) -> Self {
-        self.shared.num_chans.fetch_add(1, Ordering::SeqCst);
-        Self {
-            cancel_rx: self.cancel_rx.clone(),
-            timeout_rx: crossbeam_channel::at(self.timeout_at),
-            timeout_at: self.timeout_at,
-            shared: Arc::clone(&self.shared),
-        }
-    }
-}
-
-pub struct CtxHandle {
-    shared: Arc<CtxShared>,
-}
-
-impl CtxHandle {
-    pub fn cancel(&self) {
-        self.shared.cancel();
-    }
-}
-
-struct CtxShared {
-    cancel_tx: Sender<()>,
-    num_chans: AtomicUsize,
-}
-
-impl CtxShared {
-    fn new(cancel_tx: Sender<()>) -> Self {
-        Self {
-            cancel_tx,
-            num_chans: AtomicUsize::new(1),
-        }
-    }
-
-    fn cancel(&self) {
-        for _ in 0..self.num_chans.load(Ordering::SeqCst) {
-            let _ = self.cancel_tx.try_send(());
-        }
-    }
-}
-
-type BoxedError = Box<dyn std::error::Error + Send + Sync>;
-
 type SenderFunc = Box<dyn FnMut(Sbp) -> Result<(), BoxedError> + Send>;
 
 struct MsgSender(Arc<Mutex<SenderFunc>>);
@@ -439,90 +342,20 @@ impl MsgSender {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
-    SenderError(BoxedError),
-    WriteError(WriteSettingError),
-    ParseError,
-    TimedOut,
-    Canceled,
+fn request_matches(group: &str, name: &str, setting: &SbpString<Vec<u8>, Multipart>) -> bool {
+    let fields = split_multipart(setting);
+    matches!(fields.as_slice(), [g, n, ..] if g == group && n == name)
 }
 
-impl From<BoxedError> for Error {
-    fn from(v: BoxedError) -> Self {
-        Self::SenderError(v)
-    }
+fn split_multipart(s: &SbpString<Vec<u8>, Multipart>) -> Vec<Cow<'_, str>> {
+    let mut parts: Vec<_> = s
+        .as_bytes()
+        .split(|b| *b == 0)
+        .map(String::from_utf8_lossy)
+        .collect();
+    parts.pop();
+    parts
 }
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::SenderError(err) => write!(f, "{}", err),
-            Error::WriteError(err) => write!(f, "{}", err),
-            Error::ParseError => write!(f, "failed to parse setting"),
-            Error::TimedOut => write!(f, "timed out"),
-            Error::Canceled => write!(f, "canceled"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteSettingError {
-    ValueRejected,
-    SettingRejected,
-    ParseFailed,
-    ReadOnly,
-    ModifyDisabled,
-    ServiceFailed,
-    Timeout,
-    Unknown,
-}
-
-impl From<u8> for WriteSettingError {
-    fn from(n: u8) -> Self {
-        match n {
-            1 => WriteSettingError::ValueRejected,
-            2 => WriteSettingError::SettingRejected,
-            3 => WriteSettingError::ParseFailed,
-            4 => WriteSettingError::ReadOnly,
-            5 => WriteSettingError::ModifyDisabled,
-            6 => WriteSettingError::ServiceFailed,
-            7 => WriteSettingError::Timeout,
-            _ => WriteSettingError::Unknown,
-        }
-    }
-}
-
-impl std::fmt::Display for WriteSettingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WriteSettingError::ValueRejected => {
-                write!(f, "setting value invalid",)
-            }
-            WriteSettingError::SettingRejected => {
-                write!(f, "setting does not exist")
-            }
-            WriteSettingError::ParseFailed => {
-                write!(f, "could not parse setting value ")
-            }
-            WriteSettingError::ReadOnly => {
-                write!(f, "setting is read only")
-            }
-            WriteSettingError::ModifyDisabled => {
-                write!(f, "setting is not modifiable")
-            }
-            WriteSettingError::ServiceFailed => write!(f, "system failure during setting"),
-            WriteSettingError::Timeout => write!(f, "request wasn't replied in time"),
-            WriteSettingError::Unknown => {
-                write!(f, "unknown settings write response")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WriteSettingError {}
 
 #[cfg(test)]
 mod tests {

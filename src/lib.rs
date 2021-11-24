@@ -1,5 +1,10 @@
 mod client;
-pub mod settings;
+mod context;
 
-pub use client::{Client, Context, Entry, Error, WriteSettingError};
-pub use settings::{Setting, SettingKind, SettingValue};
+pub mod error;
+pub mod setting;
+
+pub use client::{Client, Entry};
+pub use context::Context;
+pub use error::Error;
+pub use setting::{Setting, SettingKind, SettingValue};
