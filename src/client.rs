@@ -12,6 +12,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::thread;
+use log::trace;
 use parking_lot::Mutex;
 use sbp::{
     link::{Link, LinkSource},
@@ -162,6 +163,7 @@ impl<'a> Client<'a> {
         done_rx: &Receiver<()>,
         ctx: &Context,
     ) -> Result<Option<Entry>, Error> {
+        trace!("read_by_idx: {}", index);
         let (tx, rx) = crossbeam_channel::bounded(1);
         let key = self.link.register(move |msg: MsgSettingsReadByIndexResp| {
             if index == msg.index {
@@ -188,6 +190,7 @@ impl<'a> Client<'a> {
         name: String,
         ctx: Context,
     ) -> Result<Option<Entry>, Error> {
+        trace!("read_setting: {} {}", group, name);
         let req = MsgSettingsReadReq {
             sender_id: Some(SENDER_ID),
             setting: format!("{}\0{}\0", group, name).into(),
@@ -221,6 +224,7 @@ impl<'a> Client<'a> {
         value: String,
         ctx: Context,
     ) -> Result<Entry, Error> {
+        trace!("write_setting: {} {} {}", group, name, value);
         let req = MsgSettingsWrite {
             sender_id: Some(SENDER_ID),
             setting: format!("{}\0{}\0{}\0", group, name, value).into(),

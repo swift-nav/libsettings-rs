@@ -84,10 +84,7 @@ impl Setting {
             || {
                 let group = group.as_ref().to_owned();
                 let name = name.as_ref().to_owned();
-                warn!(
-                    "No settings documentation entry or name: {} in group: {}",
-                    name, group
-                );
+                warn!("No documentation entry setting {} -> {}", group, name);
                 Cow::Owned(Setting {
                     group,
                     name,
