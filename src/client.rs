@@ -174,7 +174,7 @@ impl<'a> Client<'a> {
             index,
         })?;
         let res = crossbeam_channel::select! {
-            recv(rx) -> msg => msg.unwrap().map(Some),
+            recv(rx) -> msg => msg.expect("read_by_index channel disconnected").map(Some),
             recv(done_rx) -> _ => Ok(None),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
             recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
@@ -198,7 +198,7 @@ impl<'a> Client<'a> {
                 if fields.len() < 2 || fields[0] != group || fields[1] != name {
                     return;
                 }
-                let _ = tx.send(Entry::try_from(msg).map(|e| {
+                let _ = tx.try_send(Entry::try_from(msg).map(|e| {
                     if e.value.is_some() {
                         Some(e)
                     } else {
@@ -212,7 +212,7 @@ impl<'a> Client<'a> {
             setting: format!("{}\0{}\0", group, name).into(),
         })?;
         let res = crossbeam_channel::select! {
-            recv(rx) -> msg => msg.unwrap(),
+            recv(rx) -> msg => msg.expect("read_setting_inner channel disconnected"),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
             recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
         };
@@ -236,7 +236,7 @@ impl<'a> Client<'a> {
                 if fields.len() < 2 || fields[0] != group || fields[1] != name {
                     return;
                 }
-                let _ = tx.send(Entry::try_from(msg));
+                let _ = tx.try_send(Entry::try_from(msg));
             }
         });
         self.sender.send(MsgSettingsWrite {
@@ -244,7 +244,7 @@ impl<'a> Client<'a> {
             setting: format!("{}\0{}\0{}\0", group, name, value).into(),
         })?;
         let res = crossbeam_channel::select! {
-            recv(rx) -> msg => msg.unwrap(),
+            recv(rx) -> msg => msg.expect("write_setting_inner channel disconnected"),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
             recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
         };
