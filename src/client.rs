@@ -164,10 +164,9 @@ impl<'a> Client<'a> {
     ) -> Result<Option<Entry>, Error> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let key = self.link.register(move |msg: MsgSettingsReadByIndexResp| {
-            if index != msg.index {
-                return;
+            if index == msg.index {
+                let _ = tx.try_send(Entry::try_from(msg));
             }
-            let _ = tx.try_send(Entry::try_from(msg));
         });
         self.sender.send(MsgSettingsReadByIndexReq {
             sender_id: Some(SENDER_ID),
@@ -189,15 +188,13 @@ impl<'a> Client<'a> {
         name: String,
         ctx: Context,
     ) -> Result<Option<Entry>, Error> {
+        let req = MsgSettingsReadReq {
+            sender_id: Some(SENDER_ID),
+            setting: format!("{}\0{}\0", group, name).into(),
+        };
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register({
-            let group = group.clone();
-            let name = name.clone();
-            move |msg: MsgSettingsReadResp| {
-                let fields = split_multipart(&msg.setting);
-                if fields.len() < 2 || fields[0] != group || fields[1] != name {
-                    return;
-                }
+        let key = self.link.register(move |msg: MsgSettingsReadResp| {
+            if request_matches(&group, &name, &msg.setting) {
                 let _ = tx.try_send(Entry::try_from(msg).map(|e| {
                     if e.value.is_some() {
                         Some(e)
@@ -207,10 +204,7 @@ impl<'a> Client<'a> {
                 }));
             }
         });
-        self.sender.send(MsgSettingsReadReq {
-            sender_id: Some(SENDER_ID),
-            setting: format!("{}\0{}\0", group, name).into(),
-        })?;
+        self.sender.send(req)?;
         let res = crossbeam_channel::select! {
             recv(rx) -> msg => msg.expect("read_setting_inner channel disconnected"),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
@@ -227,22 +221,17 @@ impl<'a> Client<'a> {
         value: String,
         ctx: Context,
     ) -> Result<Entry, Error> {
+        let req = MsgSettingsWrite {
+            sender_id: Some(SENDER_ID),
+            setting: format!("{}\0{}\0{}\0", group, name, value).into(),
+        };
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let key = self.link.register({
-            let group = group.clone();
-            let name = name.clone();
-            move |msg: MsgSettingsWriteResp| {
-                let fields = split_multipart(&msg.setting);
-                if fields.len() < 2 || fields[0] != group || fields[1] != name {
-                    return;
-                }
+        let key = self.link.register(move |msg: MsgSettingsWriteResp| {
+            if request_matches(&group, &name, &msg.setting) {
                 let _ = tx.try_send(Entry::try_from(msg));
             }
         });
-        self.sender.send(MsgSettingsWrite {
-            sender_id: Some(SENDER_ID),
-            setting: format!("{}\0{}\0{}\0", group, name, value).into(),
-        })?;
+        self.sender.send(req)?;
         let res = crossbeam_channel::select! {
             recv(rx) -> msg => msg.expect("write_setting_inner channel disconnected"),
             recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
@@ -251,6 +240,11 @@ impl<'a> Client<'a> {
         self.link.unregister(key);
         res
     }
+}
+
+fn request_matches(group: &str, name: &str, setting: &SbpString<Vec<u8>, Multipart>) -> bool {
+    let fields = split_multipart(setting);
+    matches!(fields.as_slice(), [g, n, ..] if g == group && n == name)
 }
 
 #[derive(Debug, Clone, PartialEq)]
