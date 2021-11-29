@@ -166,6 +166,9 @@ pub enum SettingValue {
 
 impl SettingValue {
     pub fn parse(v: &str, kind: SettingKind) -> Option<Self> {
+        if v.is_empty() {
+            return None;
+        }
         match kind {
             SettingKind::Integer => v.parse().ok().map(SettingValue::Integer),
             SettingKind::Boolean if v == "True" => Some(SettingValue::Boolean(true)),

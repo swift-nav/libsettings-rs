@@ -285,7 +285,7 @@ impl TryFrom<MsgSettingsReadResp> for Entry {
                     value: None,
                 })
             }
-            [group, name, value] | [group, name, value, ..] => {
+            [group, name, value] => {
                 let setting = Setting::new(&group, &name);
                 let value = SettingValue::parse(value, setting.kind);
                 Ok(Entry { setting, value })
@@ -307,11 +307,7 @@ impl TryFrom<MsgSettingsReadByIndexResp> for Entry {
                 } else {
                     Setting::with_fmt_type(group, name, fmt_type)
                 };
-                let value = if !value.is_empty() {
-                    SettingValue::parse(value, setting.kind)
-                } else {
-                    None
-                };
+                let value = SettingValue::parse(value, setting.kind);
                 Ok(Entry { setting, value })
             }
             _ => Err(Error::ParseError),
