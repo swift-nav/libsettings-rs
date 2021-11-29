@@ -17,7 +17,7 @@ impl Context {
     pub fn new() -> (Context, CtxHandle) {
         let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded();
         let timeout_rx = crossbeam_channel::never();
-        let timeout_at = Instant::now() + Duration::from_secs(u64::MAX);
+        let timeout_at = Instant::now() + Duration::new(31_557_600_000, 0); // a millenia;
         let shared = Arc::new(Shared {
             cancel_tx,
             num_chans: AtomicUsize::new(1),
