@@ -1,928 +1,590 @@
 use std::{
-    convert::TryInto,
-    ffi::{self, CStr, CString},
-    os::raw::{c_char, c_void},
-    ptr, slice,
+    borrow::Cow,
+    convert::TryFrom,
+    io,
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
     time::Duration,
 };
 
-use crate::bindings::{
-    sbp_msg_callback_t, sbp_msg_callbacks_node_t, settings_api_t, settings_create,
-    settings_destroy, settings_read_bool, settings_read_by_idx, settings_read_float,
-    settings_read_int, settings_read_str, settings_t,
-    settings_write_res_e_SETTINGS_WR_MODIFY_DISABLED, settings_write_res_e_SETTINGS_WR_OK,
-    settings_write_res_e_SETTINGS_WR_PARSE_FAILED, settings_write_res_e_SETTINGS_WR_READ_ONLY,
-    settings_write_res_e_SETTINGS_WR_SERVICE_FAILED,
-    settings_write_res_e_SETTINGS_WR_SETTING_REJECTED, settings_write_res_e_SETTINGS_WR_TIMEOUT,
-    settings_write_res_e_SETTINGS_WR_VALUE_REJECTED, settings_write_str, size_t,
-};
 use crossbeam_channel::Receiver;
 use crossbeam_utils::thread;
-use log::{debug, error, warn};
+use log::trace;
+use parking_lot::Mutex;
 use sbp::{
-    link::{Key, Link},
-    Sbp, SbpMessage,
+    link::{Link, LinkSource},
+    messages::settings::{
+        MsgSettingsReadByIndexDone, MsgSettingsReadByIndexReq, MsgSettingsReadByIndexResp,
+        MsgSettingsReadReq, MsgSettingsReadResp, MsgSettingsWrite, MsgSettingsWriteResp,
+    },
+    sbp_string::Multipart,
+    Sbp, SbpIterExt, SbpString,
 };
 
-use crate::{Setting, SettingKind, SettingValue};
+use crate::context::Context;
+use crate::error::{BoxedError, Error};
+use crate::setting::{Setting, SettingValue};
 
 const SENDER_ID: u16 = 0x42;
-const NUM_WORKERS: usize = 5;
+const NUM_WORKERS: usize = 10;
 
 pub struct Client<'a> {
-    inner: Box<ClientInner<'a>>,
+    link: Link<'a, ()>,
+    sender: MsgSender,
+    handle: Option<JoinHandle<()>>,
 }
-
-struct ClientInner<'a> {
-    context: *mut Context<'a>,
-    api: *mut settings_api_t,
-    ctx: *mut settings_t,
-}
-
-impl Drop for ClientInner<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            // Safety: self.api was created via Box::into_raw.
-            // self.context is freed via the call to settings_destroy
-            let _ = Box::from_raw(self.api);
-            settings_destroy(&mut self.ctx);
-        }
-    }
-}
-
-unsafe impl Send for ClientInner<'_> {}
-unsafe impl Sync for ClientInner<'_> {}
 
 impl<'a> Client<'a> {
-    pub fn new<F>(link: Link<'a, ()>, sender: F) -> Client<'a>
+    pub fn new<R, W>(reader: R, mut writer: W) -> Client<'static>
     where
-        F: FnMut(Sbp) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + 'static,
+        R: io::Read + Send + 'static,
+        W: io::Write + Send + 'static,
     {
-        let context = Box::new(Context {
+        let source = LinkSource::new();
+        let mut client = Client::<'static>::with_link(source.link(), move |msg| {
+            sbp::to_writer(&mut writer, &msg).map_err(Into::into)
+        });
+        client.handle = Some(std::thread::spawn(move || {
+            let messages = sbp::iter_messages(reader).log_errors(log::Level::Warn);
+            for msg in messages {
+                source.send(msg);
+            }
+        }));
+        client
+    }
+
+    pub fn with_link<F>(link: Link<'a, ()>, sender: F) -> Client<'a>
+    where
+        F: FnMut(Sbp) -> Result<(), BoxedError> + Send + 'static,
+    {
+        Self {
             link,
-            sender: Box::new(sender),
-            callbacks: Vec::new(),
-            lock: Lock::new(),
-            event: None,
-        });
-
-        let api = Box::new(settings_api_t {
-            ctx: ptr::null_mut(),
-            send: Some(libsettings_send),
-            send_from: Some(libsettings_send_from),
-            wait_init: Some(libsettings_wait_init),
-            wait: Some(libsettings_wait),
-            wait_deinit: None,
-            signal: Some(libsettings_signal),
-            wait_thd: Some(libsettings_wait_thd),
-            signal_thd: Some(libsettings_signal_thd),
-            lock: Some(libsettings_lock),
-            unlock: Some(libsettings_unlock),
-            register_cb: Some(libsettings_register_cb),
-            unregister_cb: Some(libsettings_unregister_cb),
-            log: None,
-            log_preformatted: Some(libsettings_log_wrapper),
-        });
-
-        let mut inner = Box::new(ClientInner {
-            context: ptr::null_mut(),
-            api: Box::into_raw(api),
-            ctx: ptr::null_mut(),
-        });
-
-        let context_raw = Box::into_raw(context);
-        inner.context = context_raw;
-
-        // Safety: inner.api was just created via Box::into_raw so it is
-        // properly aligned and non-null
-        unsafe {
-            (*inner.api).ctx = context_raw as *mut c_void;
+            sender: MsgSender(Arc::new(Mutex::new(Box::new(sender)))),
+            handle: None,
         }
-
-        inner.ctx = unsafe { settings_create(SENDER_ID, inner.api) };
-        assert!(!inner.ctx.is_null());
-
-        Client { inner }
     }
 
-    pub fn read_all(&self) -> (Vec<ReadByIdxResult>, Vec<Error<ReadSettingError>>) {
-        let (_, r) = crossbeam_channel::bounded(0);
-        self.read_all_inner(r)
+    pub fn write_setting(
+        &mut self,
+        group: impl Into<String>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Entry, Error> {
+        let (ctx, _ctx_handle) = Context::new();
+        self.write_setting_ctx(group, name, value, ctx)
     }
 
-    pub fn read_all_timeout(
-        &self,
-        timeout: Duration,
-    ) -> (Vec<ReadByIdxResult>, Vec<Error<ReadSettingError>>) {
-        let (done_s, done_r) = crossbeam_channel::bounded(0);
-        let (stop_s, stop_r) = crossbeam_channel::bounded(NUM_WORKERS);
-        thread::scope(move |scope| {
-            scope.spawn(move |_| {
-                crossbeam_channel::select! {
-                    recv(done_r) -> _ => return,
-                    default(timeout) => (),
-                };
-                warn!("settings read_all timed out");
-                for _ in 0..NUM_WORKERS {
-                    let _ = stop_s.try_send(());
-                }
-            });
-            let res = self.read_all_inner(stop_r);
-            let _ = done_s.send(());
-            res
-        })
-        .unwrap()
+    pub fn write_setting_ctx(
+        &mut self,
+        group: impl Into<String>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        ctx: Context,
+    ) -> Result<Entry, Error> {
+        self.write_setting_inner(group.into(), name.into(), value.into(), ctx)
     }
 
-    fn read_all_inner(
-        &self,
-        stop: Receiver<()>,
-    ) -> (Vec<ReadByIdxResult>, Vec<Error<ReadSettingError>>) {
-        thread::scope(move |scope| {
-            let (idx_s, idx_r) = crossbeam_channel::bounded(NUM_WORKERS);
-            let (settings_s, settings_r) = crossbeam_channel::unbounded();
-            let (errors_s, errors_r) = crossbeam_channel::unbounded();
+    pub fn read_setting(
+        &mut self,
+        group: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<Option<Entry>, Error> {
+        let (ctx, _ctx_handle) = Context::new();
+        self.read_setting_ctx(group, name, ctx)
+    }
 
-            scope.spawn(move |_| {
-                let mut idx = 0;
-                while idx_s.send(idx).is_ok() {
-                    idx += 1;
-                }
-            });
+    pub fn read_setting_ctx(
+        &mut self,
+        group: impl Into<String>,
+        name: impl Into<String>,
+        ctx: Context,
+    ) -> Result<Option<Entry>, Error> {
+        self.read_setting_inner(group.into(), name.into(), ctx)
+    }
 
+    pub fn read_all(&mut self) -> (Vec<Entry>, Vec<Error>) {
+        let (ctx, _ctx_handle) = Context::new();
+        self.read_all_ctx(ctx)
+    }
+
+    pub fn read_all_ctx(&mut self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
+        self.read_all_inner(ctx)
+    }
+
+    fn read_all_inner(&mut self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
+        let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
+        let done_key = self.link.register(move |_: MsgSettingsReadByIndexDone| {
             for _ in 0..NUM_WORKERS {
-                scope.spawn({
-                    let idx_r = idx_r.clone();
-                    let settings_s = settings_s.clone();
-                    let errors_s = errors_s.clone();
-                    let stop = stop.clone();
-                    move |_| {
-                        for idx in idx_r.iter() {
-                            if stop.try_recv().is_ok() {
+                let _ = done_tx.try_send(());
+            }
+        });
+        let (settings, errors) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
+        let idx = AtomicU16::new(0);
+        thread::scope(|scope| {
+            for _ in 0..NUM_WORKERS {
+                let this = &self;
+                let idx = &idx;
+                let settings = &settings;
+                let errors = &errors;
+                let done_rx = &done_rx;
+                let ctx = ctx.clone();
+                scope.spawn(move |_| loop {
+                    let idx = idx.fetch_add(1, Ordering::SeqCst);
+                    match this.read_by_index(idx, done_rx, &ctx) {
+                        Ok(Some(setting)) => {
+                            settings.lock().push((idx, setting));
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let exit = matches!(err, Error::TimedOut | Error::Canceled);
+                            errors.lock().push((idx, err));
+                            if exit {
                                 break;
-                            }
-                            match self.read_by_index(idx) {
-                                Ok(Some(setting)) => settings_s.send(setting).unwrap(),
-                                Ok(None) => break,
-                                Err(err) => {
-                                    errors_s.send(Error::Err(err)).unwrap();
-                                    break;
-                                }
                             }
                         }
                     }
                 });
             }
-            // we need to drop these before calling `.iter()` to disconnect the channels
-            // otherwise `.iter()` will never terminate
-            drop(idx_r);
-            drop(settings_s);
-            drop(errors_s);
-            (settings_r.iter().collect(), errors_r.iter().collect())
         })
-        .expect("read_all worker thread panicked")
+        .expect("read_all worker thread panicked");
+        self.link.unregister(done_key);
+        settings.lock().sort_by_key(|(idx, _)| *idx);
+        errors.lock().sort_by_key(|(idx, _)| *idx);
+        (
+            settings.into_inner().into_iter().map(|e| e.1).collect(),
+            errors.into_inner().into_iter().map(|e| e.1).collect(),
+        )
     }
 
-    pub fn read_by_index(&self, idx: u16) -> Result<Option<ReadByIdxResult>, ReadSettingError> {
-        const BUF_SIZE: usize = 255;
-
-        let mut section = Vec::<c_char>::with_capacity(BUF_SIZE);
-        let mut name = Vec::<c_char>::with_capacity(BUF_SIZE);
-        let mut value = Vec::<c_char>::with_capacity(BUF_SIZE);
-        let mut fmt_type = Vec::<c_char>::with_capacity(BUF_SIZE);
-        let mut event = Event::new();
-
-        let status = unsafe {
-            settings_read_by_idx(
-                self.inner.ctx,
-                &mut event as *mut Event as *mut _,
-                idx,
-                section.as_mut_ptr(),
-                BUF_SIZE as size_t,
-                name.as_mut_ptr(),
-                BUF_SIZE as size_t,
-                value.as_mut_ptr(),
-                BUF_SIZE as size_t,
-                fmt_type.as_mut_ptr(),
-                BUF_SIZE as size_t,
-            )
-        };
-
-        match status {
-            0 => Ok(Some(unsafe {
-                ReadByIdxResult {
-                    group: CStr::from_ptr(section.as_ptr())
-                        .to_string_lossy()
-                        .into_owned(),
-                    name: CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned(),
-                    value: CStr::from_ptr(value.as_ptr())
-                        .to_string_lossy()
-                        .into_owned(),
-                    fmt_type: CStr::from_ptr(fmt_type.as_ptr())
-                        .to_string_lossy()
-                        .into_owned(),
-                }
-            })),
-            status if status > 0 => Ok(None),
-            status => Err(status.into()),
-        }
-    }
-
-    pub fn read_setting(
+    fn read_by_index(
         &self,
-        group: impl AsRef<str>,
-        name: impl AsRef<str>,
-    ) -> Option<Result<SettingValue, Error<ReadSettingError>>> {
-        self.read_setting_inner(group.as_ref(), name.as_ref())
+        index: u16,
+        done_rx: &Receiver<()>,
+        ctx: &Context,
+    ) -> Result<Option<Entry>, Error> {
+        trace!("read_by_idx: {}", index);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let key = self.link.register(move |msg: MsgSettingsReadByIndexResp| {
+            if index == msg.index {
+                let _ = tx.try_send(Entry::try_from(msg));
+            }
+        });
+        self.sender.send(MsgSettingsReadByIndexReq {
+            sender_id: Some(SENDER_ID),
+            index,
+        })?;
+        let res = crossbeam_channel::select! {
+            recv(rx) -> msg => msg.expect("read_by_index channel disconnected").map(Some),
+            recv(done_rx) -> _ => Ok(None),
+            recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
+            recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
+        };
+        self.link.unregister(key);
+        res
     }
 
     fn read_setting_inner(
-        &self,
-        group: &str,
-        name: &str,
-    ) -> Option<Result<SettingValue, Error<ReadSettingError>>> {
-        let setting = Setting::find(group, name)?;
-
-        let cgroup = match CString::new(group) {
-            Ok(cgroup) => cgroup,
-            Err(e) => return Some(Err(e.into())),
+        &mut self,
+        group: String,
+        name: String,
+        ctx: Context,
+    ) -> Result<Option<Entry>, Error> {
+        trace!("read_setting: {} {}", group, name);
+        let req = MsgSettingsReadReq {
+            sender_id: Some(SENDER_ID),
+            setting: format!("{}\0{}\0", group, name).into(),
         };
-
-        let cname = match CString::new(name) {
-            Ok(cname) => cname,
-            Err(e) => return Some(Err(e.into())),
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let key = self.link.register(move |msg: MsgSettingsReadResp| {
+            if request_matches(&group, &name, &msg.setting) {
+                let _ = tx.try_send(Entry::try_from(msg).map(|e| {
+                    if e.value.is_some() {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                }));
+            }
+        });
+        self.sender.send(req)?;
+        let res = crossbeam_channel::select! {
+            recv(rx) -> msg => msg.expect("read_setting_inner channel disconnected"),
+            recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
+            recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
         };
-
-        let (res, status) = match setting.kind {
-            SettingKind::Integer => unsafe {
-                let mut value: i32 = 0;
-                let status =
-                    settings_read_int(self.inner.ctx, cgroup.as_ptr(), cname.as_ptr(), &mut value);
-                (SettingValue::Integer(value), status)
-            },
-            SettingKind::Boolean => unsafe {
-                let mut value: bool = false;
-                let status =
-                    settings_read_bool(self.inner.ctx, cgroup.as_ptr(), cname.as_ptr(), &mut value);
-                (SettingValue::Boolean(value), status)
-            },
-            SettingKind::Float | SettingKind::Double => unsafe {
-                let mut value: f32 = 0.0;
-                let status = settings_read_float(
-                    self.inner.ctx,
-                    cgroup.as_ptr(),
-                    cname.as_ptr(),
-                    &mut value,
-                );
-                (SettingValue::Float(value), status)
-            },
-            SettingKind::String | SettingKind::Enum | SettingKind::PackedBitfield => unsafe {
-                let mut buf = Vec::<c_char>::with_capacity(1024);
-                let status = settings_read_str(
-                    self.inner.ctx,
-                    cgroup.as_ptr(),
-                    cname.as_ptr(),
-                    buf.as_mut_ptr(),
-                    buf.capacity().try_into().unwrap(),
-                );
-                (
-                    SettingValue::String(
-                        CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned(),
-                    ),
-                    status,
-                )
-            },
-        };
-
-        debug!("{} {} {:?} {}", setting.group, setting.name, res, status);
-
-        if status == 0 {
-            Some(Ok(res))
-        } else {
-            Some(Err(status.into()))
-        }
-    }
-
-    pub fn write_setting(
-        &self,
-        group: impl AsRef<str>,
-        name: impl AsRef<str>,
-        value: impl AsRef<str>,
-    ) -> Result<(), Error<WriteSettingError>> {
-        self.write_setting_inner(group.as_ref(), name.as_ref(), value.as_ref())
+        self.link.unregister(key);
+        res
     }
 
     fn write_setting_inner(
-        &self,
-        group: &str,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Error<WriteSettingError>> {
-        let cgroup = CString::new(group)?;
-        let cname = CString::new(name)?;
-        let cvalue = CString::new(value)?;
-        let mut event = Event::new();
-
-        let result = unsafe {
-            settings_write_str(
-                self.inner.ctx,
-                &mut event as *mut Event as *mut _,
-                cgroup.as_ptr(),
-                cname.as_ptr(),
-                cvalue.as_ptr(),
-            )
+        &mut self,
+        group: String,
+        name: String,
+        value: String,
+        ctx: Context,
+    ) -> Result<Entry, Error> {
+        trace!("write_setting: {} {} {}", group, name, value);
+        let req = MsgSettingsWrite {
+            sender_id: Some(SENDER_ID),
+            setting: format!("{}\0{}\0{}\0", group, name, value).into(),
         };
-
-        #[allow(non_upper_case_globals)]
-        match result {
-            settings_write_res_e_SETTINGS_WR_OK => Ok(()),
-            code => Err(code.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Error<E> {
-    NulError,
-    Err(E),
-}
-
-impl<E> From<ffi::NulError> for Error<E> {
-    fn from(_: ffi::NulError) -> Self {
-        Error::NulError
-    }
-}
-
-impl<E> From<u32> for Error<E>
-where
-    E: From<u32>,
-{
-    fn from(err: u32) -> Self {
-        Error::Err(err.into())
-    }
-}
-
-impl<E> From<i32> for Error<E>
-where
-    E: From<i32>,
-{
-    fn from(err: i32) -> Self {
-        Error::Err(err.into())
-    }
-}
-
-impl<E> std::fmt::Display for Error<E>
-where
-    E: std::error::Error,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::NulError => write!(f, "error converting to CString"),
-            Error::Err(err) => write!(f, "{}", err),
-        }
-    }
-}
-
-impl<E> std::error::Error for Error<E> where E: std::error::Error {}
-
-#[derive(Debug, Clone)]
-pub struct ReadByIdxResult {
-    pub group: String,
-    pub name: String,
-    pub value: String,
-    pub fmt_type: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteSettingError {
-    ValueRejected,
-    SettingRejected,
-    ParseFailed,
-    ReadOnly,
-    ModifyDisabled,
-    ServiceFailed,
-    Timeout,
-    Unknown,
-}
-
-impl From<u32> for WriteSettingError {
-    fn from(n: u32) -> Self {
-        #[cfg(target_os = "windows")]
-        let n = n as i32;
-
-        #[allow(non_upper_case_globals)]
-        match n {
-            settings_write_res_e_SETTINGS_WR_VALUE_REJECTED => WriteSettingError::ValueRejected,
-            settings_write_res_e_SETTINGS_WR_SETTING_REJECTED => WriteSettingError::SettingRejected,
-            settings_write_res_e_SETTINGS_WR_PARSE_FAILED => WriteSettingError::ParseFailed,
-            settings_write_res_e_SETTINGS_WR_READ_ONLY => WriteSettingError::ReadOnly,
-            settings_write_res_e_SETTINGS_WR_MODIFY_DISABLED => WriteSettingError::ModifyDisabled,
-            settings_write_res_e_SETTINGS_WR_SERVICE_FAILED => WriteSettingError::ServiceFailed,
-            settings_write_res_e_SETTINGS_WR_TIMEOUT => WriteSettingError::Timeout,
-            _ => WriteSettingError::Unknown,
-        }
-    }
-}
-
-impl From<i32> for WriteSettingError {
-    fn from(n: i32) -> Self {
-        (n as u32).into()
-    }
-}
-
-impl std::fmt::Display for WriteSettingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WriteSettingError::ValueRejected => {
-                write!(f, "setting value invalid",)
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let key = self.link.register(move |msg: MsgSettingsWriteResp| {
+            if request_matches(&group, &name, &msg.setting) {
+                let _ = tx.try_send(Entry::try_from(msg));
             }
-            WriteSettingError::SettingRejected => {
-                write!(f, "setting does not exist")
-            }
-            WriteSettingError::ParseFailed => {
-                write!(f, "could not parse setting value ")
-            }
-            WriteSettingError::ReadOnly => {
-                write!(f, "setting is read only")
-            }
-            WriteSettingError::ModifyDisabled => {
-                write!(f, "setting is not modifiable")
-            }
-            WriteSettingError::ServiceFailed => write!(f, "system failure during setting"),
-            WriteSettingError::Timeout => write!(f, "request wasn't replied in time"),
-            WriteSettingError::Unknown => {
-                write!(f, "unknown settings write response")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WriteSettingError {}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ReadSettingError {
-    code: u32,
-}
-
-impl From<u32> for ReadSettingError {
-    fn from(code: u32) -> Self {
-        Self { code }
-    }
-}
-
-impl From<i32> for ReadSettingError {
-    fn from(code: i32) -> Self {
-        (code as u32).into()
-    }
-}
-
-impl std::fmt::Display for ReadSettingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "settings read failed with status code {}", self.code)
-    }
-}
-
-impl std::error::Error for ReadSettingError {}
-
-type SenderFunc = Box<dyn FnMut(Sbp) -> Result<(), Box<dyn std::error::Error + Send + Sync>>>;
-
-#[repr(C)]
-struct Context<'a> {
-    link: Link<'a, ()>,
-    sender: SenderFunc,
-    callbacks: Vec<Callback>,
-    event: Option<Event>,
-    lock: Lock,
-}
-
-impl Context<'_> {
-    fn callback_broker(&self, msg: Sbp) {
-        let cb_data = {
-            let _guard = self.lock.lock();
-            let idx = if let Some(idx) = self
-                .callbacks
-                .iter()
-                .position(|cb| cb.msg_type == msg.message_type())
-            {
-                idx
-            } else {
-                error!(
-                    "callback not registered for message type {}",
-                    msg.message_type()
-                );
-                return;
-            };
-            self.callbacks[idx]
+        });
+        self.sender.send(req)?;
+        let res = crossbeam_channel::select! {
+            recv(rx) -> msg => msg.expect("write_setting_inner channel disconnected"),
+            recv(ctx.timeout_rx) -> _ => Err(Error::TimedOut),
+            recv(ctx.cancel_rx) -> _ => Err(Error::Canceled),
         };
-        let mut frame = match sbp::to_vec(&msg) {
-            Ok(frame) => frame,
-            Err(e) => {
-                error!("failed to frame sbp message {}", e);
-                return;
+        self.link.unregister(key);
+        res
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub setting: Cow<'static, Setting>,
+    pub value: Option<SettingValue>,
+}
+
+impl TryFrom<MsgSettingsWriteResp> for Entry {
+    type Error = Error;
+
+    fn try_from(msg: MsgSettingsWriteResp) -> Result<Self, Self::Error> {
+        if msg.status != 0 {
+            return Err(Error::WriteError(msg.status.into()));
+        }
+        let fields = split_multipart(&msg.setting);
+        if let [group, name, value] = fields.as_slice() {
+            let setting = Setting::new(group, name);
+            let value = SettingValue::parse(value, setting.kind);
+            Ok(Entry { setting, value })
+        } else {
+            Err(Error::ParseError)
+        }
+    }
+}
+
+impl TryFrom<MsgSettingsReadResp> for Entry {
+    type Error = Error;
+
+    fn try_from(msg: MsgSettingsReadResp) -> Result<Self, Self::Error> {
+        let fields = split_multipart(&msg.setting);
+        match fields.as_slice() {
+            [group, name] => {
+                let setting = Setting::new(&group, &name);
+                Ok(Entry {
+                    setting,
+                    value: None,
+                })
             }
-        };
-        let frame_len = frame.len();
-        let payload = &mut frame[sbp::HEADER_LEN..frame_len - sbp::CRC_LEN];
-        let cb = match cb_data.cb {
-            Some(cb) => cb,
-            None => {
-                error!("provided callback was none");
-                return;
+            [group, name, value] => {
+                let setting = Setting::new(&group, &name);
+                let value = SettingValue::parse(value, setting.kind);
+                Ok(Entry { setting, value })
             }
-        };
-        let cb_context = cb_data.cb_context;
-        unsafe {
-            cb(
-                msg.sender_id().unwrap_or(0),
-                payload.len() as u8,
-                payload.as_mut_ptr(),
-                cb_context,
-            )
-        };
-    }
-}
-
-unsafe impl Send for Context<'_> {}
-unsafe impl Sync for Context<'_> {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Callback {
-    node: usize,
-    msg_type: u16,
-    cb: sbp_msg_callback_t,
-    cb_context: *mut c_void,
-    key: Key,
-}
-
-#[repr(C)]
-struct Event {
-    condvar: parking_lot::Condvar,
-    lock: parking_lot::Mutex<()>,
-}
-
-impl Event {
-    fn new() -> Self {
-        Self {
-            condvar: parking_lot::Condvar::new(),
-            lock: parking_lot::Mutex::new(()),
-        }
-    }
-
-    fn wait_timeout(&self, ms: i32) -> bool {
-        let mut started = self.lock.lock();
-        let result = self
-            .condvar
-            .wait_for(&mut started, Duration::from_millis(ms as u64));
-        !result.timed_out()
-    }
-
-    fn set(&self) {
-        let _ = self.lock.lock();
-        if !self.condvar.notify_one() {
-            warn!("event set did not notify anything");
+            _ => Err(Error::ParseError),
         }
     }
 }
 
-#[repr(C)]
-struct Lock(parking_lot::Mutex<()>);
+impl TryFrom<MsgSettingsReadByIndexResp> for Entry {
+    type Error = Error;
 
-impl Lock {
-    fn new() -> Self {
-        Self(parking_lot::Mutex::new(()))
-    }
-
-    fn lock(&self) -> parking_lot::MutexGuard<()> {
-        self.0.lock()
-    }
-
-    fn acquire(&self) {
-        std::mem::forget(self.0.lock());
-    }
-
-    fn release(&self) {
-        // Safety: Only called via libsettings_unlock after libsettings_lock was called
-        unsafe { self.0.force_unlock() }
-    }
-}
-
-struct CtxPtr(*mut c_void);
-
-unsafe impl Sync for CtxPtr {}
-unsafe impl Send for CtxPtr {}
-
-#[no_mangle]
-/// Thread safety: Should be called with lock already held
-unsafe extern "C" fn libsettings_register_cb(
-    ctx: *mut c_void,
-    msg_type: u16,
-    cb: sbp_msg_callback_t,
-    cb_context: *mut c_void,
-    node: *mut *mut sbp_msg_callbacks_node_t,
-) -> i32 {
-    let context: &mut Context = &mut *(ctx as *mut _);
-    let ctx_ptr = CtxPtr(ctx);
-    let key = context.link.register_by_id(&[msg_type], move |msg: Sbp| {
-        let context: &mut Context = &mut *(ctx_ptr.0 as *mut _);
-        context.callback_broker(msg)
-    });
-    context.callbacks.push(Callback {
-        node: node as usize,
-        msg_type,
-        cb,
-        cb_context,
-        key,
-    });
-    0
-}
-
-#[no_mangle]
-/// Thread safety: Should be called with lock already held
-unsafe extern "C" fn libsettings_unregister_cb(
-    ctx: *mut c_void,
-    node: *mut *mut sbp_msg_callbacks_node_t,
-) -> i32 {
-    let context: &mut Context = &mut *(ctx as *mut _);
-    if (node as i32) == 0 {
-        return -127;
-    }
-    let idx = match context
-        .callbacks
-        .iter()
-        .position(|cb| cb.node == node as usize)
-    {
-        Some(idx) => idx,
-        None => return -127,
-    };
-    let key = context.callbacks.remove(idx).key;
-    context.link.unregister(key);
-    0
-}
-
-#[no_mangle]
-unsafe extern "C" fn libsettings_send(
-    ctx: *mut c_void,
-    msg_type: u16,
-    len: u8,
-    payload: *mut u8,
-) -> i32 {
-    libsettings_send_from(ctx, msg_type, len, payload, 0)
-}
-
-#[no_mangle]
-unsafe extern "C" fn libsettings_send_from(
-    ctx: *mut ::std::os::raw::c_void,
-    msg_type: u16,
-    len: u8,
-    payload: *mut u8,
-    sender_id: u16,
-) -> i32 {
-    let context: &mut Context = &mut *(ctx as *mut _);
-    let msg = match Sbp::from_frame(sbp::Frame {
-        msg_type,
-        sender_id,
-        payload: slice::from_raw_parts(payload, len as usize),
-    }) {
-        Ok(msg) => msg,
-        Err(err) => {
-            error!("error parsing message: {}", err);
-            return -1;
+    fn try_from(msg: MsgSettingsReadByIndexResp) -> Result<Self, Self::Error> {
+        let fields = split_multipart(&msg.setting);
+        match fields.as_slice() {
+            [group, name, value, fmt_type] => {
+                let setting = if fmt_type.is_empty() {
+                    Setting::new(group, name)
+                } else {
+                    Setting::with_fmt_type(group, name, fmt_type)
+                };
+                let value = SettingValue::parse(value, setting.kind);
+                Ok(Entry { setting, value })
+            }
+            _ => Err(Error::ParseError),
         }
-    };
-    if let Err(err) = (context.sender)(msg) {
-        error!("failed to send message: {}", err);
-        return -1;
-    };
-    0
-}
-
-#[no_mangle]
-extern "C" fn libsettings_wait(ctx: *mut c_void, timeout_ms: i32) -> i32 {
-    assert!(timeout_ms > 0);
-    let context: &mut Context = unsafe { &mut *(ctx as *mut _) };
-    if context.event.as_ref().unwrap().wait_timeout(timeout_ms) {
-        0
-    } else {
-        -1
     }
 }
 
-#[no_mangle]
-extern "C" fn libsettings_wait_thd(event: *mut c_void, timeout_ms: i32) -> i32 {
-    assert!(timeout_ms > 0);
-    let event: &Event = unsafe { &*(event as *const _) };
-    if event.wait_timeout(timeout_ms) {
-        0
-    } else {
-        -1
+type SenderFunc = Box<dyn FnMut(Sbp) -> Result<(), BoxedError> + Send>;
+
+struct MsgSender(Arc<Mutex<SenderFunc>>);
+
+impl MsgSender {
+    const RETRIES: usize = 5;
+    const TIMEOUT: Duration = Duration::from_millis(100);
+
+    fn send(&self, msg: impl Into<Sbp>) -> Result<(), BoxedError> {
+        self.send_inner(msg.into(), 0)
+    }
+
+    fn send_inner(&self, msg: Sbp, tries: usize) -> Result<(), BoxedError> {
+        let res = (self.0.lock())(msg.clone());
+        if res.is_err() && tries < Self::RETRIES {
+            std::thread::sleep(Self::TIMEOUT);
+            self.send_inner(msg, tries + 1)
+        } else {
+            res
+        }
     }
 }
 
-#[no_mangle]
-extern "C" fn libsettings_signal_thd(event: *mut c_void) {
-    let event: &Event = unsafe { &*(event as *const _) };
-    event.set();
+fn request_matches(group: &str, name: &str, setting: &SbpString<Vec<u8>, Multipart>) -> bool {
+    let fields = split_multipart(setting);
+    matches!(fields.as_slice(), [g, n, ..] if g == group && n == name)
 }
 
-#[no_mangle]
-extern "C" fn libsettings_signal(ctx: *mut c_void) {
-    let context: &Context = unsafe { &*(ctx as *const _) };
-    context.event.as_ref().unwrap().set();
-}
-
-#[no_mangle]
-extern "C" fn libsettings_lock(ctx: *mut c_void) {
-    let context: &Context = unsafe { &*(ctx as *const _) };
-    context.lock.acquire();
-}
-
-#[no_mangle]
-extern "C" fn libsettings_unlock(ctx: *mut c_void) {
-    let context: &Context = unsafe { &*(ctx as *const _) };
-    context.lock.release();
-}
-
-#[no_mangle]
-extern "C" fn libsettings_wait_init(ctx: *mut c_void) -> i32 {
-    let context: &mut Context = unsafe { &mut *(ctx as *mut _) };
-    context.event = Some(Event::new());
-    0
-}
-
-#[no_mangle]
-extern "C" fn libsettings_log_wrapper(
-    priority: ::std::os::raw::c_int,
-    format: *const ::std::os::raw::c_char,
-) {
-    let level = match priority {
-        i32::MIN..=3 => log::Level::Error,
-        4 => log::Level::Warn,
-        5 => log::Level::Info,
-        6 => log::Level::Info,
-        7.. => log::Level::Debug,
-    };
-    let msg = unsafe { CStr::from_ptr(format) };
-    let msg = msg.to_string_lossy();
-    log::log!(level, "{}", msg);
+fn split_multipart(s: &SbpString<Vec<u8>, Multipart>) -> Vec<Cow<'_, str>> {
+    let mut parts: Vec<_> = s
+        .as_bytes()
+        .split(|b| *b == 0)
+        .map(String::from_utf8_lossy)
+        .collect();
+    parts.pop();
+    parts
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
     use super::*;
 
-    use std::io::{Read, Write};
-
     use crossbeam_utils::thread::scope;
-    use sbp::link::LinkSource;
     use sbp::messages::settings::{MsgSettingsReadReq, MsgSettingsReadResp};
-    use sbp::{SbpIterExt, SbpString};
+    use sbp::{SbpMessage, SbpString};
 
-    static SETTINGS_SENDER_ID: u16 = 0x42;
+    #[test]
+    fn test_should_retry() {
+        let (group, name) = ("sbp", "obs_msg_max_size");
+        let mut mock = Mock::with_errors(5);
+        mock.req_reply(
+            MsgSettingsReadReq {
+                sender_id: Some(SENDER_ID),
+                setting: format!("{}\0{}\0", group, name).into(),
+            },
+            MsgSettingsReadResp {
+                sender_id: Some(0x42),
+                setting: format!("{}\0{}\010\0", group, name).into(),
+            },
+        );
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let response = client.read_setting(group, name).unwrap().unwrap();
+        assert!(matches!(response.value, Some(SettingValue::Integer(10))));
+    }
 
-    fn read_setting(
-        rdr: impl Read + Send,
-        mut wtr: impl Write + 'static,
-        group: &str,
-        name: &str,
-    ) -> Option<Result<SettingValue, Error<ReadSettingError>>> {
-        scope(move |scope| {
-            let source = LinkSource::new();
-            let link = source.link();
-            scope.spawn(move |_| {
-                let messages = sbp::iter_messages(rdr).handle_errors(|e| panic!("{}", e));
-                for message in messages {
-                    source.send(message);
-                }
+    #[test]
+    fn read_setting_timeout() {
+        let (group, name) = ("sbp", "obs_msg_max_size");
+        let mock = Mock::new();
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let (ctx, _ctx_handle) = Context::with_timeout(Duration::from_millis(100));
+        let now = Instant::now();
+        let mut response = Ok(None);
+        scope(|scope| {
+            scope.spawn(|_| {
+                response = client.read_setting_ctx(group, name, ctx);
             });
-            let client = Client::new(link, move |msg| {
-                sbp::to_writer(&mut wtr, &msg).map_err(Into::into)
-            });
-            client.read_setting(group, name)
         })
-        .unwrap()
+        .unwrap();
+        assert!(now.elapsed().as_millis() >= 100);
+        assert!(matches!(response, Err(Error::TimedOut)));
+    }
+
+    #[test]
+    fn read_setting_cancel() {
+        let (group, name) = ("sbp", "obs_msg_max_size");
+        let mock = Mock::new();
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let (ctx, ctx_handle) = Context::new();
+        let now = Instant::now();
+        let mut response = Ok(None);
+        scope(|scope| {
+            scope.spawn(|_| {
+                response = client.read_setting_ctx(group, name, ctx);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            ctx_handle.cancel();
+        })
+        .unwrap();
+        assert!(now.elapsed().as_millis() >= 100);
+        assert!(matches!(response, Err(Error::Canceled)));
     }
 
     #[test]
     fn mock_read_setting_int() {
         let (group, name) = ("sbp", "obs_msg_max_size");
-        let mut stream = mockstream::SyncMockStream::new();
-
-        let request_msg = MsgSettingsReadReq {
-            sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name)),
-        };
-
-        stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
-
-        let reply_msg = MsgSettingsReadResp {
-            sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\010\0", group, name)),
-        };
-
-        stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
-
-        let response = read_setting(stream.clone(), stream, group, name);
-
-        assert!(matches!(response, Some(Ok(SettingValue::Integer(10)))));
+        let mut mock = Mock::new();
+        mock.req_reply(
+            MsgSettingsReadReq {
+                sender_id: Some(SENDER_ID),
+                setting: format!("{}\0{}\0", group, name).into(),
+            },
+            MsgSettingsReadResp {
+                sender_id: Some(0x42),
+                setting: format!("{}\0{}\010\0", group, name).into(),
+            },
+        );
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let response = client.read_setting(group, name).unwrap().unwrap();
+        assert!(matches!(response.value, Some(SettingValue::Integer(10))));
     }
 
     #[test]
     fn mock_read_setting_bool() {
         let (group, name) = ("surveyed_position", "broadcast");
-        let mut stream = mockstream::SyncMockStream::new();
-
-        let request_msg = MsgSettingsReadReq {
-            sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name)),
-        };
-
-        stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
-
-        let reply_msg = MsgSettingsReadResp {
-            sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\0True\0", group, name)),
-        };
-
-        stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
-
-        let response = read_setting(stream.clone(), stream, group, name);
-
-        assert!(matches!(response, Some(Ok(SettingValue::Boolean(true)))));
+        let mut mock = Mock::new();
+        mock.req_reply(
+            MsgSettingsReadReq {
+                sender_id: Some(SENDER_ID),
+                setting: format!("{}\0{}\0", group, name).into(),
+            },
+            MsgSettingsReadResp {
+                sender_id: Some(0x42),
+                setting: SbpString::from(format!("{}\0{}\0True\0", group, name)),
+            },
+        );
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let response = client.read_setting(group, name).unwrap().unwrap();
+        assert!(matches!(response.value, Some(SettingValue::Boolean(true))));
     }
 
     #[test]
     fn mock_read_setting_double() {
         let (group, name) = ("surveyed_position", "surveyed_lat");
-        let mut stream = mockstream::SyncMockStream::new();
-
-        let request_msg = MsgSettingsReadReq {
-            sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name)),
-        };
-
-        stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
-
-        let reply_msg = MsgSettingsReadResp {
-            sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\00.1\0", group, name)),
-        };
-
-        stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
-
-        let response = read_setting(stream.clone(), stream, group, name)
-            .unwrap()
-            .unwrap();
-        assert_eq!(response, SettingValue::Float(0.1));
+        let mut mock = Mock::new();
+        mock.req_reply(
+            MsgSettingsReadReq {
+                sender_id: Some(SENDER_ID),
+                setting: SbpString::from(format!("{}\0{}\0", group, name)),
+            },
+            MsgSettingsReadResp {
+                sender_id: Some(SENDER_ID),
+                setting: SbpString::from(format!("{}\0{}\00.1\0", group, name)),
+            },
+        );
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let response = client.read_setting(group, name).unwrap().unwrap();
+        assert_eq!(response.value, Some(SettingValue::Float(0.1)));
     }
 
     #[test]
     fn mock_read_setting_string() {
         let (group, name) = ("rtcm_out", "ant_descriptor");
-        let mut stream = mockstream::SyncMockStream::new();
-
-        let request_msg = MsgSettingsReadReq {
-            sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\0", group, name)),
-        };
-
-        stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
-
-        let reply_msg = MsgSettingsReadResp {
-            sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0foo\0", group, name)),
-        };
-
-        stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
-
-        let response = read_setting(stream.clone(), stream, group, name)
-            .unwrap()
-            .unwrap();
-        assert_eq!(response, SettingValue::String("foo".into()));
+        let mut mock = Mock::new();
+        mock.req_reply(
+            MsgSettingsReadReq {
+                sender_id: Some(0x42),
+                setting: SbpString::from(format!("{}\0{}\0", group, name)),
+            },
+            MsgSettingsReadResp {
+                sender_id: Some(SENDER_ID),
+                setting: SbpString::from(format!("{}\0{}\0foo\0", group, name)),
+            },
+        );
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let response = client.read_setting(group, name).unwrap().unwrap();
+        assert_eq!(response.value, Some(SettingValue::String("foo".into())));
     }
 
     #[test]
     fn mock_read_setting_enum() {
         let (group, name) = ("frontend", "antenna_selection");
-        let mut stream = mockstream::SyncMockStream::new();
+        let mut mock = Mock::new();
+        mock.req_reply(
+            MsgSettingsReadReq {
+                sender_id: Some(SENDER_ID),
+                setting: SbpString::from(format!("{}\0{}\0", group, name)),
+            },
+            MsgSettingsReadResp {
+                sender_id: Some(0x42),
+                setting: SbpString::from(format!("{}\0{}\0Secondary\0", group, name)),
+            },
+        );
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let response = client.read_setting(group, name).unwrap().unwrap();
+        assert_eq!(
+            response.value,
+            Some(SettingValue::String("Secondary".into()))
+        );
+    }
 
-        let request_msg = MsgSettingsReadReq {
-            sender_id: Some(SETTINGS_SENDER_ID),
-            setting: SbpString::from(format!("{}\0{}\0", group, name)),
-        };
+    #[derive(Clone)]
+    struct Mock {
+        stream: mockstream::SyncMockStream,
+        write_errors: u16,
+    }
 
-        stream.wait_for(sbp::to_vec(&request_msg).unwrap().as_ref());
+    impl Mock {
+        fn new() -> Self {
+            Self {
+                stream: mockstream::SyncMockStream::new(),
+                write_errors: 0,
+            }
+        }
 
-        let reply_msg = MsgSettingsReadResp {
-            sender_id: Some(0x42),
-            setting: SbpString::from(format!("{}\0{}\0Secondary\0", group, name)),
-        };
+        fn with_errors(write_errors: u16) -> Self {
+            Self {
+                stream: mockstream::SyncMockStream::new(),
+                write_errors,
+            }
+        }
 
-        stream.push_bytes_to_read(sbp::to_vec(&reply_msg).unwrap().as_ref());
+        fn req_reply(&mut self, req: impl SbpMessage, res: impl SbpMessage) {
+            self.reqs_reply(&[req], res)
+        }
 
-        let response = read_setting(stream.clone(), stream, group, name)
-            .unwrap()
-            .unwrap();
-        assert_eq!(response, SettingValue::String("Secondary".into()));
+        fn reqs_reply(&mut self, reqs: &[impl SbpMessage], res: impl SbpMessage) {
+            let bytes: Vec<_> = reqs
+                .iter()
+                .flat_map(|req| sbp::to_vec(req).unwrap())
+                .collect();
+            self.stream.wait_for(bytes.as_ref());
+            let bytes = sbp::to_vec(&res).unwrap();
+            self.stream.push_bytes_to_read(bytes.as_ref());
+        }
+
+        fn into_io(self) -> (impl io::Read, impl io::Write) {
+            (self.clone(), self)
+        }
+    }
+
+    impl Read for Mock {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.stream.read(buf)
+        }
+    }
+
+    impl Write for Mock {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.write_errors > 0 {
+                self.write_errors -= 1;
+                Err(io::Error::new(io::ErrorKind::Other, "error"))
+            } else {
+                self.stream.write(buf)
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
     }
 }

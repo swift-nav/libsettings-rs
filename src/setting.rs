@@ -1,5 +1,6 @@
-use std::{fmt, fs, io, path::Path};
+use std::{borrow::Cow, fmt, fs, io, path::Path};
 
+use log::warn;
 use once_cell::sync::OnceCell;
 use serde::{
     de::{self, Unexpected},
@@ -23,7 +24,7 @@ pub fn load(settings: Vec<Setting>) -> Result<(), Vec<Setting>> {
     SETTINGS.set(settings)
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 pub struct Setting {
     pub name: String,
 
@@ -77,6 +78,38 @@ impl Setting {
             .iter()
             .find(|s| s.group == group && s.name == name)
     }
+
+    pub(crate) fn new(group: impl AsRef<str>, name: impl AsRef<str>) -> Cow<'static, Setting> {
+        Setting::find(&group, &name).map_or_else(
+            || {
+                let group = group.as_ref().to_owned();
+                let name = name.as_ref().to_owned();
+                warn!("No documentation entry setting {} -> {}", group, name);
+                Cow::Owned(Setting {
+                    group,
+                    name,
+                    ..Default::default()
+                })
+            },
+            Cow::Borrowed,
+        )
+    }
+
+    pub(crate) fn with_fmt_type(
+        group: impl AsRef<str>,
+        name: impl AsRef<str>,
+        fmt_type: impl AsRef<str>,
+    ) -> Cow<'static, Setting> {
+        let mut setting = Setting::new(group, name);
+        if setting.kind == SettingKind::Enum {
+            let mut parts = fmt_type.as_ref().splitn(2, ':');
+            let possible_values = parts.nth(1);
+            if let Some(p) = possible_values {
+                setting.to_mut().enumerated_possible_values = Some(p.to_owned());
+            }
+        }
+        setting
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -103,6 +136,12 @@ pub enum SettingKind {
     PackedBitfield,
 }
 
+impl Default for SettingKind {
+    fn default() -> Self {
+        SettingKind::String
+    }
+}
+
 impl SettingKind {
     pub fn to_str(&self) -> &'static str {
         match self {
@@ -123,6 +162,24 @@ pub enum SettingValue {
     Boolean(bool),
     Float(f32),
     String(String),
+}
+
+impl SettingValue {
+    pub fn parse(v: &str, kind: SettingKind) -> Option<Self> {
+        if v.is_empty() {
+            return None;
+        }
+        match kind {
+            SettingKind::Integer => v.parse().ok().map(SettingValue::Integer),
+            SettingKind::Boolean if v == "True" => Some(SettingValue::Boolean(true)),
+            SettingKind::Boolean if v == "False" => Some(SettingValue::Boolean(false)),
+            SettingKind::Float | SettingKind::Double => v.parse().ok().map(SettingValue::Float),
+            SettingKind::String | SettingKind::Enum | SettingKind::PackedBitfield => {
+                Some(SettingValue::String(v.to_owned()))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SettingValue {

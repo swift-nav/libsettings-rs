@@ -1,14 +1,10 @@
 mod client;
-pub mod settings;
+mod context;
 
-pub use client::{Client, Error, ReadSettingError, WriteSettingError};
-pub use settings::{Setting, SettingKind, SettingValue};
+pub mod error;
+pub mod setting;
 
-pub(crate) mod bindings {
-    #![allow(non_upper_case_globals)]
-    #![allow(non_camel_case_types)]
-    #![allow(non_snake_case)]
-    #![allow(deref_nullptr)]
-    #![allow(dead_code)]
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
+pub use client::{Client, Entry};
+pub use context::Context;
+pub use error::Error;
+pub use setting::{Setting, SettingKind, SettingValue};
