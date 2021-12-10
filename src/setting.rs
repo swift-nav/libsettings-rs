@@ -16,7 +16,26 @@ fn bundled_settings() -> Vec<Setting> {
 
 pub fn load_from_path(path: impl AsRef<Path>) -> Result<(), LoadFromPathError> {
     let file = fs::File::open(path).map_err(LoadFromPathError::Io)?;
-    let settings: Vec<Setting> = serde_yaml::from_reader(file).map_err(LoadFromPathError::Serde)?;
+    let settings: Vec<serde_yaml::Mapping> =
+        serde_yaml::from_reader(file).map_err(LoadFromPathError::Serde)?;
+    let type_key = serde_yaml::Value::String("type".into());
+    let settings = settings
+        .into_iter()
+        .map(|mut map| {
+            if map.contains_key(&type_key) {
+                serde_yaml::from_value(map.into())
+            } else {
+                map.insert(type_key.clone(), serde_yaml::Value::String("string".into()));
+                let setting: Setting = serde_yaml::from_value(map.into())?;
+                warn!(
+                    "Missing `type` field for {} -> {}",
+                    setting.group, setting.name
+                );
+                Ok(setting)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(LoadFromPathError::Serde)?;
     load(settings).map_err(|_| LoadFromPathError::AlreadySet)
 }
 
