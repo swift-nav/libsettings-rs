@@ -1,23 +1,13 @@
 [package]
 name = "sbp-settings"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["Swift Navigation <dev@swift-nav.com>"]
 edition = "2018"
 description = "SwiftNav settings API library"
 repository = "https://github.com/swift-nav/libsettings-rs"
 license-file = "LICENSE"
 readme = "README.md"
-include = [
-    "libsettings_wrapper.h",
-    "**/*.rs",
-    "src/libsettings/settings.yaml",
-    "src/libsettings/CMakeLists.txt",
-    "src/libsettings/cmake",
-    "src/libsettings/src",
-    "src/libsettings/include",
-    "src/libsettings/third_party/libsbp/c",
-    "src/libsettings/third_party/libswiftnav",
-]
+include = ["**/*.rs", "src/libsettings/settings.yaml"]
 
 [dependencies]
 crossbeam-channel = "0.5"
