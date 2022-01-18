@@ -321,13 +321,14 @@ struct MsgSender(Arc<Mutex<SenderFunc>>);
 
 impl MsgSender {
     const RETRIES: usize = 5;
-    const TIMEOUT: Duration = Duration::from_millis(100);
+    const TIMEOUT: Duration = Duration::from_millis(1000);
 
     fn send(&self, msg: impl Into<Sbp>) -> Result<(), BoxedError> {
         self.send_inner(msg.into(), 0)
     }
 
     fn send_inner(&self, msg: Sbp, tries: usize) -> Result<(), BoxedError> {
+        println!("{:?}", msg);
         let res = (self.0.lock())(msg.clone());
         if res.is_err() && tries < Self::RETRIES {
             std::thread::sleep(Self::TIMEOUT);
