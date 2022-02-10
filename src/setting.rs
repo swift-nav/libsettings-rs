@@ -177,7 +177,7 @@ impl SettingKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingValue {
-    Integer(i32),
+    Integer(i64),
     Boolean(bool),
     Float(f32),
     String(String),
