@@ -130,12 +130,13 @@ impl<'a> Client<'a> {
                 let settings = &settings;
                 let errors = &errors;
                 let done_rx = &done_rx;
-                let ctx = ctx.clone();
+                let mut ctx = ctx.clone();
                 scope.spawn(move |_| loop {
                     let idx = idx.fetch_add(1, Ordering::SeqCst);
                     match this.read_by_index(idx, done_rx, &ctx) {
                         Ok(Some(setting)) => {
                             settings.lock().push((idx, setting));
+                            ctx.reset_timeout();
                         }
                         Ok(None) => break,
                         Err(err) => {

@@ -10,6 +10,7 @@ pub struct Context {
     pub(crate) cancel_rx: Receiver<()>,
     pub(crate) timeout_rx: Receiver<Instant>,
     timeout_at: Instant,
+    timeout_duration: Duration,
     shared: Arc<Shared>,
 }
 
@@ -17,7 +18,8 @@ impl Context {
     pub fn new() -> (Context, CtxHandle) {
         let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded();
         let timeout_rx = crossbeam_channel::never();
-        let timeout_at = Instant::now() + Duration::new(3_154_000_000, 0); // a century;
+        let timeout_duration = Duration::new(3_154_000_000, 0); // a century;
+        let timeout_at = Instant::now() + timeout_duration;
         let shared = Arc::new(Shared {
             cancel_tx,
             num_chans: AtomicUsize::new(1),
@@ -27,6 +29,7 @@ impl Context {
                 cancel_rx,
                 timeout_rx,
                 timeout_at,
+                timeout_duration,
                 shared: Arc::clone(&shared),
             },
             CtxHandle { shared },
@@ -44,6 +47,10 @@ impl Context {
         self.timeout_rx = crossbeam_channel::at(self.timeout_at);
     }
 
+    pub fn reset_timeout(&mut self) {
+        self.set_timeout(self.timeout_duration);
+    }
+
     pub fn cancel(&self) {
         self.shared.cancel();
     }
@@ -56,6 +63,7 @@ impl Clone for Context {
             cancel_rx: self.cancel_rx.clone(),
             timeout_rx: crossbeam_channel::at(self.timeout_at),
             timeout_at: self.timeout_at,
+            timeout_duration: self.timeout_duration,
             shared: Arc::clone(&self.shared),
         }
     }
