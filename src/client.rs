@@ -73,7 +73,7 @@ impl<'a> Client<'a> {
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<Entry, Error> {
-        let (ctx, _ctx_handle) = Context::new();
+        let (ctx, _ctx_handle) = Context::with_timeout(Duration::from_millis(100));
         self.write_setting_ctx(group, name, value, ctx)
     }
 
