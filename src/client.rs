@@ -30,7 +30,6 @@ use crate::setting::{Setting, SettingValue};
 
 const SENDER_ID: u16 = 0x42;
 const NUM_WORKERS: usize = 10;
-const SETTINGS_WRITE_TIMEOUT_MS: u64 = 1000;
 
 pub struct Client<'a> {
     link: Link<'a, ()>,
@@ -74,8 +73,7 @@ impl<'a> Client<'a> {
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<Entry, Error> {
-        let (ctx, _ctx_handle) =
-            Context::with_timeout(Duration::from_millis(SETTINGS_WRITE_TIMEOUT_MS));
+        let (ctx, _ctx_handle) = Context::new();
         self.write_setting_ctx(group, name, value, ctx)
     }
 
@@ -89,12 +87,33 @@ impl<'a> Client<'a> {
         self.write_setting_inner(group.into(), name.into(), value.into(), ctx)
     }
 
+    pub fn write_setting_with_timeout(
+        &mut self,
+        group: impl Into<String>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Entry, Error> {
+        let (ctx, _ctx_handle) = Context::with_timeout(timeout);
+        self.write_setting_ctx(group, name, value, ctx)
+    }
+
     pub fn read_setting(
         &mut self,
         group: impl Into<String>,
         name: impl Into<String>,
     ) -> Result<Option<Entry>, Error> {
         let (ctx, _ctx_handle) = Context::new();
+        self.read_setting_ctx(group, name, ctx)
+    }
+
+    pub fn read_setting_with_timeout(
+        &mut self,
+        group: impl Into<String>,
+        name: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Option<Entry>, Error> {
+        let (ctx, _ctx_handle) = Context::with_timeout(timeout);
         self.read_setting_ctx(group, name, ctx)
     }
 
