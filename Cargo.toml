@@ -1,6 +1,6 @@
 [package]
 name = "sbp-settings"
-version = "0.6.10"
+version = "0.6.11"
 authors = ["Swift Navigation <dev@swift-nav.com>"]
 edition = "2018"
 description = "SwiftNav settings API library"
