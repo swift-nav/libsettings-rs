@@ -332,6 +332,11 @@ impl TryFrom<MsgSettingsReadByIndexResp> for Entry {
                 let value = SettingValue::parse(value, setting.kind);
                 Ok(Entry { setting, value })
             }
+            [group, name, value] => {
+                let setting = Setting::new(group, name);
+                let value = SettingValue::parse(value, setting.kind);
+                Ok(Entry { setting, value })
+            }
             _ => Err(Error::ParseError),
         }
     }
