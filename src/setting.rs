@@ -131,7 +131,7 @@ impl Setting {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
 pub enum SettingKind {
     #[serde(rename = "integer", alias = "int")]
     Integer,
