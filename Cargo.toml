@@ -17,7 +17,7 @@ once_cell = "1"
 parking_lot = "0.12"
 sbp = { version = "4", features = ["link"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.8"
+serde_yaml = "0.9"
 
 [dev-dependencies]
 mockstream = { git = "https://github.com/lazy-bitfield/rust-mockstream", rev = "0.0.4" }
