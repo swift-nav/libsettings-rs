@@ -43,7 +43,7 @@ pub fn load(settings: Vec<Setting>) -> Result<(), Vec<Setting>> {
     SETTINGS.set(settings)
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
 pub struct Setting {
     pub name: String,
 
@@ -131,7 +131,7 @@ impl Setting {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
 pub enum SettingKind {
     #[serde(rename = "integer", alias = "int")]
     Integer,
