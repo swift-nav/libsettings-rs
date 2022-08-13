@@ -43,7 +43,7 @@ pub fn load(settings: Vec<Setting>) -> Result<(), Vec<Setting>> {
     SETTINGS.set(settings)
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
 pub struct Setting {
     pub name: String,
 
