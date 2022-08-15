@@ -508,7 +508,7 @@ mod tests {
         let (reader, writer) = mock.into_io();
         let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
-        assert_eq!(response.value, Some(SettingValue::Float(0.1)));
+        assert_eq!(response.value, Some(SettingValue::Double(0.1)));
     }
 
     #[test]
