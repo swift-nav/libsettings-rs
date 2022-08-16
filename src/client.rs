@@ -492,6 +492,26 @@ mod tests {
     }
 
     #[test]
+    fn mock_read_setting_float() {
+        let (group, name) = ("ins", "filter_vel_half_life_alpha");
+        let mut mock = Mock::new();
+        mock.req_reply(
+            MsgSettingsReadReq {
+                sender_id: Some(SENDER_ID),
+                setting: SbpString::from(format!("{}\0{}\0", group, name)),
+            },
+            MsgSettingsReadResp {
+                sender_id: Some(SENDER_ID),
+                setting: SbpString::from(format!("{}\0{}\00.1\0", group, name)),
+            },
+        );
+        let (reader, writer) = mock.into_io();
+        let mut client = Client::new(reader, writer);
+        let response = client.read_setting(group, name).unwrap().unwrap();
+        assert_eq!(response.value, Some(SettingValue::Float(0.1)));
+    }
+
+    #[test]
     fn mock_read_setting_double() {
         let (group, name) = ("surveyed_position", "surveyed_lat");
         let mut mock = Mock::new();
@@ -508,7 +528,7 @@ mod tests {
         let (reader, writer) = mock.into_io();
         let mut client = Client::new(reader, writer);
         let response = client.read_setting(group, name).unwrap().unwrap();
-        assert_eq!(response.value, Some(SettingValue::Float(0.1)));
+        assert_eq!(response.value, Some(SettingValue::Double(0.1)));
     }
 
     #[test]

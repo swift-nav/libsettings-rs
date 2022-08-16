@@ -180,6 +180,7 @@ pub enum SettingValue {
     Integer(i64),
     Boolean(bool),
     Float(f32),
+    Double(f64),
     String(String),
 }
 
@@ -192,7 +193,8 @@ impl SettingValue {
             SettingKind::Integer => v.parse().ok().map(SettingValue::Integer),
             SettingKind::Boolean if v == "True" => Some(SettingValue::Boolean(true)),
             SettingKind::Boolean if v == "False" => Some(SettingValue::Boolean(false)),
-            SettingKind::Float | SettingKind::Double => v.parse().ok().map(SettingValue::Float),
+            SettingKind::Float => v.parse().ok().map(SettingValue::Float),
+            SettingKind::Double => v.parse().ok().map(SettingValue::Double),
             SettingKind::String | SettingKind::Enum | SettingKind::PackedBitfield => {
                 Some(SettingValue::String(v.to_owned()))
             }
@@ -210,6 +212,7 @@ impl fmt::Display for SettingValue {
             SettingValue::Boolean(true) => write!(f, "True"),
             SettingValue::Boolean(false) => write!(f, "False"),
             SettingValue::Float(s) => s.fmt(f),
+            SettingValue::Double(s) => s.fmt(f),
             SettingValue::String(s) => s.fmt(f),
         }
     }
