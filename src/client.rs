@@ -301,14 +301,14 @@ impl TryFrom<MsgSettingsReadResp> for Entry {
         let fields = split_multipart(&msg.setting);
         match fields.as_slice() {
             [group, name] => {
-                let setting = Setting::new(&group, &name);
+                let setting = Setting::new(group, name);
                 Ok(Entry {
                     setting,
                     value: None,
                 })
             }
             [group, name, value] => {
-                let setting = Setting::new(&group, &name);
+                let setting = Setting::new(group, name);
                 let value = SettingValue::parse(value, setting.kind);
                 Ok(Entry { setting, value })
             }
