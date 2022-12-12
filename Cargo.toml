@@ -15,7 +15,7 @@ crossbeam-utils = "0.8"
 log = "0.4"
 once_cell = "1"
 parking_lot = "0.12"
-sbp = { git = "https://github.com/swift-nav/libsbp.git", ref = "adrian/frame_hastime", features = ["json", "link", "swiftnav"] }
+sbp = { git = "https://github.com/swift-nav/libsbp.git", ref = "adrian/frame_hastime" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 
