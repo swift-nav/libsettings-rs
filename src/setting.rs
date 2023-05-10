@@ -132,6 +132,7 @@ impl Setting {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[derive(Default)]
 pub enum SettingKind {
     #[serde(rename = "integer", alias = "int")]
     Integer,
@@ -146,6 +147,7 @@ pub enum SettingKind {
     Double,
 
     #[serde(rename = "string")]
+    #[default]
     String,
 
     #[serde(rename = "enum")]
@@ -155,11 +157,7 @@ pub enum SettingKind {
     PackedBitfield,
 }
 
-impl Default for SettingKind {
-    fn default() -> Self {
-        SettingKind::String
-    }
-}
+
 
 impl SettingKind {
     pub fn to_str(&self) -> &'static str {
