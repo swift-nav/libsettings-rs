@@ -15,7 +15,7 @@ crossbeam-utils = "0.8"
 log = "0.4"
 once_cell = "1"
 parking_lot = "0.12"
-sbp = { version = "4", features = ["link"] }
+sbp = { version = "5", features = ["link"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 
