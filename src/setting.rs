@@ -341,7 +341,7 @@ mod tests {
                 readonly: false,
                 description: Some("The frequency at which GNSS navigation solution is computed.\n".to_string()),
                 default_value: Some("10".to_string()),
-                notes: Some("Minimum is 1 Hz. Maximum is 10 Hz for RTK positioning with a maximum of 15 used satellites.\nAt 5 Hz and lower the maximum number of used satellites is 22. 20 Hz is an absolute maximum with\na limit of 5 used satellites.\n\nSystem with inertial fusion (Duro Inertial, Piksi Multi Inertial) can output position at a higher rate\nthan the GNSS-only solution. See fused_soln_freq in the INS group.\n".to_string()),
+                notes: Some("Minimum is 1 Hz. Maximum is 10 Hz for RTK positioning with a maximum of 15 used satellites.\nAt 5 Hz and lower the maximum number of used satellites is 22. 20 Hz is an absolute maximum with \na limit of 5 used satellites.\n\nSystem with inertial fusion (Duro Inertial, Piksi Multi Inertial) can output position at a higher rate\nthan the GNSS-only solution. See fused_soln_freq in the INS group.\n".to_string()),
                 units: Some("Hz".to_string()),
                 enumerated_possible_values: None,
                 digits: None
