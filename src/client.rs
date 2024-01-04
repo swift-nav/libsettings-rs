@@ -154,26 +154,27 @@ impl<'a> Client<'a> {
                 let errors = &errors;
                 let done_rx = &done_rx;
                 let mut ctx = ctx.clone();
-                scope.spawn(move |_| loop {
-                    let idx = idx.fetch_add(1, Ordering::SeqCst);
-                    match this.read_by_index(idx, done_rx, &ctx) {
-                        Ok(Some(setting)) => {
-                            settings.lock().push((idx, setting));
-                            ctx.reset_timeout();
-                        }
-                        Ok(None) => break,
-                        Err(err) => {
-                            let exit = matches!(err, Error::TimedOut | Error::Canceled);
-                            errors.lock().push((idx, err));
-                            if exit {
-                                break;
+                scope.spawn(move |_| {
+                    loop {
+                        let idx = idx.fetch_add(1, Ordering::SeqCst);
+                        match this.read_by_index(idx, done_rx, &ctx) {
+                            Ok(Some(setting)) => {
+                                settings.lock().push((idx, setting));
+                                ctx.reset_timeout();
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                let exit = matches!(err, Error::TimedOut | Error::Canceled);
+                                errors.lock().push((idx, err));
+                                if exit {
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-                // drop the ref to the waitgroup for this thread
-                drop(wg);
-                );
+                    // drop the ref to the waitgroup for this thread
+                    drop(wg);
+                });
             }
         })
         .expect("read_all worker thread panicked");
