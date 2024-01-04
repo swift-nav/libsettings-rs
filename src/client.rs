@@ -159,7 +159,7 @@ impl<'a> Client<'a> {
                             settings.lock().push((idx, setting));
                             ctx.reset_timeout();
                         }
-                        Ok(None) => continue,
+                        Ok(None) => break,
                         Err(err) => {
                             let exit = matches!(err, Error::TimedOut | Error::Canceled);
                             errors.lock().push((idx, err));
