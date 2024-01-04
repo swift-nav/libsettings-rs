@@ -170,9 +170,10 @@ impl<'a> Client<'a> {
                             }
                         }
                     }
-                    // drop the ref to the waitgroup for this thread
-                    drop(wg);
-                });
+                }
+                // drop the ref to the waitgroup for this thread
+                drop(wg);
+                );
             }
         })
         .expect("read_all worker thread panicked");
