@@ -11,7 +11,7 @@ use std::{
 };
 
 use crossbeam_channel::Receiver;
-use crossbeam_utils::thread;
+use crossbeam_utils::{sync::WaitGroup, thread};
 use log::trace;
 use parking_lot::Mutex;
 use sbp::{
@@ -144,8 +144,10 @@ impl<'a> Client<'a> {
         });
         let (settings, errors) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
         let idx = AtomicU16::new(0);
+        let wg = WaitGroup::new();
         thread::scope(|scope| {
             for _ in 0..NUM_WORKERS {
+                let wg = wg.clone();
                 let this = &self;
                 let idx = &idx;
                 let settings = &settings;
@@ -168,10 +170,14 @@ impl<'a> Client<'a> {
                             }
                         }
                     }
+                    // drop the ref to the waitgroup for this thread
+                    drop(wg);
                 });
             }
         })
         .expect("read_all worker thread panicked");
+        // make sure all threads are finished
+        wg.wait();
         self.link.unregister(done_key);
         settings.lock().sort_by_key(|(idx, _)| *idx);
         errors.lock().sort_by_key(|(idx, _)| *idx);
