@@ -29,6 +29,10 @@ use crate::error::{BoxedError, Error};
 use crate::setting::{Setting, SettingValue};
 
 const SENDER_ID: u16 = 0x42;
+// Right now there is a race in the reading of the settings, a signal that
+// the settings is finished can be sent before all the settings have been
+// received. Do not increase the number of workers until this race condition
+// has been fixed
 const NUM_WORKERS: usize = 10;
 
 pub struct Client<'a> {
@@ -136,7 +140,7 @@ impl<'a> Client<'a> {
     }
 
     fn read_all_inner(&mut self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
-        let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         let done_key = self.link.register(move |_: MsgSettingsReadByIndexDone| {
             for _ in 0..NUM_WORKERS {
                 let _ = done_tx.try_send(());
