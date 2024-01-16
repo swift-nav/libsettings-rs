@@ -136,9 +136,9 @@ impl<'a> Client<'a> {
     }
 
     fn read_all_inner(&mut self, ctx: Context) -> (Vec<Entry>, Vec<Error>) {
-        let (done_tx, done_rx) = crossbeam_channel::bounded(NUM_WORKERS);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         let done_key = self.link.register(move |_: MsgSettingsReadByIndexDone| {
-            for _ in 0..NUM_WORKERS {
+            for _ in 0..1 {
                 let _ = done_tx.try_send(());
             }
         });
@@ -146,40 +146,33 @@ impl<'a> Client<'a> {
         let idx = AtomicU16::new(0);
         let wg = WaitGroup::new();
         thread::scope(|scope| {
-            for _ in 0..NUM_WORKERS {
-                let wg = wg.clone();
+            for _ in 0..1 {
                 let this = &self;
                 let idx = &idx;
                 let settings = &settings;
                 let errors = &errors;
                 let done_rx = &done_rx;
                 let mut ctx = ctx.clone();
-                scope.spawn(move |_| {
-                    loop {
-                        let idx = idx.fetch_add(1, Ordering::SeqCst);
-                        match this.read_by_index(idx, done_rx, &ctx) {
-                            Ok(Some(setting)) => {
-                                settings.lock().push((idx, setting));
-                                ctx.reset_timeout();
-                            }
-                            Ok(None) => break,
-                            Err(err) => {
-                                let exit = matches!(err, Error::TimedOut | Error::Canceled);
-                                errors.lock().push((idx, err));
-                                if exit {
-                                    break;
-                                }
+                scope.spawn(move |_| loop {
+                    let idx = idx.fetch_add(1, Ordering::SeqCst);
+                    match this.read_by_index(idx, done_rx, &ctx) {
+                        Ok(Some(setting)) => {
+                            settings.lock().push((idx, setting));
+                            ctx.reset_timeout();
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let exit = matches!(err, Error::TimedOut | Error::Canceled);
+                            errors.lock().push((idx, err));
+                            if exit {
+                                break;
                             }
                         }
                     }
-                    // drop the ref to the waitgroup for this thread
-                    drop(wg);
                 });
             }
         })
         .expect("read_all worker thread panicked");
-        // make sure all threads are finished
-        wg.wait();
         self.link.unregister(done_key);
         settings.lock().sort_by_key(|(idx, _)| *idx);
         errors.lock().sort_by_key(|(idx, _)| *idx);
